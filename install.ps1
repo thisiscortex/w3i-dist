@@ -1,4 +1,4 @@
-# Cortex - Windows installer (public distribution, no token needed).
+# W3I - Windows installer (public distribution, no token needed).
 #
 # Windows counterpart of install.sh. By default it downloads the prebuilt
 # Windows build anonymously from the PUBLIC distribution repo's latest GitHub
@@ -6,8 +6,8 @@
 #
 #   irm https://raw.githubusercontent.com/appfactory123/w3i-dist/main/install.ps1 | iex
 #
-# Installs the app to %LOCALAPPDATA%\Programs\Cortex (with Start Menu + Desktop
-# shortcuts), provisions a data dir (%USERPROFILE%\.cortex-ai-sessions) with the
+# Installs the app beside Cortex at %LOCALAPPDATA%\Programs\W3I (with Start Menu
+# + Desktop shortcuts), provisions %USERPROFILE%\.cortex-ai-sessions-w3i with the
 # bot + support files, and installs every runtime library (Node deps via Bun,
 # Python cryptography/tls-client/curl_cffi/whisper, a managed local Pocket Jarvis voice
 # environment, Google Chrome, and the Claude, Codex, Antigravity, and Grok CLIs
@@ -22,7 +22,7 @@
 #   CORTEX_TOKEN / GH_TOKEN / GITHUB_TOKEN   token -> pull from PRIVATE source repo
 #   CORTEX_PUBLIC_REPO   override the public dist repo (owner/name)
 #   CORTEX_VERSION       pin a release tag (default: latest)
-#   CORTEX_LOCAL_DIR     install Cortex app/support artifacts from this directory
+#   CORTEX_LOCAL_DIR     install W3I app/support artifacts from this directory
 #                        instead of downloading them. Pocket's model remains a
 #                        fixed verified download unless it is also present here
 #                        - for testing; no token needed.
@@ -39,11 +39,11 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 # -- Config ------------------------------------------------------------------
 $REPO        = 'appfactory123/claude-sessions'
 $PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'appfactory123/w3i-dist' }
-$APP_NAME    = 'Cortex'
-$INSTALL_DIR = Join-Path $env:LOCALAPPDATA 'Programs\Cortex'
+$APP_NAME    = 'W3I'
+$INSTALL_DIR = Join-Path $env:LOCALAPPDATA 'Programs\W3I'
 $APP_EXE     = Join-Path $INSTALL_DIR "$APP_NAME.exe"
-$DATA_DIR    = if ($env:CORTEX_DATA_DIR) { [System.IO.Path]::GetFullPath($env:CORTEX_DATA_DIR) } else { Join-Path $env:USERPROFILE '.cortex-ai-sessions' }
-$CONFIG      = Join-Path $env:USERPROFILE '.cortex-ai-sessions.env'
+$DATA_DIR    = if ($env:CORTEX_DATA_DIR) { [System.IO.Path]::GetFullPath($env:CORTEX_DATA_DIR) } else { Join-Path $env:USERPROFILE '.cortex-ai-sessions-w3i' }
+$CONFIG      = "$DATA_DIR.env"
 $TOKEN       = if ($env:CORTEX_TOKEN) { $env:CORTEX_TOKEN } elseif ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
 
 # -- Pretty output (mirrors install.sh's ok/warn/step/die) -------------------
@@ -52,7 +52,7 @@ function Warn ($m) { Write-Host "  ! $m"               -ForegroundColor Yellow }
 function Step ($m) { Write-Host ""; Write-Host "$([char]0x25B6) $m" -ForegroundColor White }  # drives the GUI progress bar
 function Die  ($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; exit 1 }
 
-Write-Host "Cortex - installer"
+Write-Host "W3I - installer"
 
 # -- Preflight ---------------------------------------------------------------
 Step 'Preflight'
@@ -62,12 +62,12 @@ if (-not $IsWindows -and $env:OS -ne 'Windows_NT') { Die 'This installer is Wind
 $rawArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 switch ($rawArch) {
   'AMD64' { $ARCH = 'x64' }
-  'ARM64' { $ARCH = 'arm64' }
+  'ARM64' { Die 'W3I currently publishes a Windows x64 build only.' }
   default { Die "Unsupported architecture: $rawArch" }
 }
 Ok "Windows / $ARCH"
 
-$APP_ZIP     = "Cortex-win-$ARCH.zip"
+$APP_ZIP     = "W3I-win-$ARCH.zip"
 $SUPPORT_TAR = 'support.tar.gz'
 $POCKET_MODEL_ASSET = 'Pocket-English-model.tar.gz'
 $POCKET_MODEL_REPOSITORY = 'appfactory123/pocket-tts-model-weight-dist'
@@ -696,7 +696,7 @@ try {
 
   # -- Dependencies (delegate to setup.ps1) ----------------------------------
   # setup.ps1 (shipped in the support bundle) installs Node deps via bun, the
-  # Python libs, and writes %USERPROFILE%\.cortex-ai-sessions.env. Reuse it so the
+  # Python libs, and writes the selected app data dir's .env. Reuse it so the
   # dependency logic lives in one place - fall back to inline basics if an older
   # bundle predates it.
   Step 'Dependencies (delegating to setup.ps1)'
@@ -708,14 +708,20 @@ try {
   $setup = Join-Path $DATA_DIR 'setup.ps1'
   if (Test-Path $setup) {
     $previousPocketAssets = [Environment]::GetEnvironmentVariable('CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR', 'Process')
+    $previousAppDataDir = [Environment]::GetEnvironmentVariable('CORTEX_DATA_DIR', 'Process')
     [Environment]::SetEnvironmentVariable(
       'CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR',
       (Join-Path $INSTALL_DIR 'resources\standalone\scripts\voice-assets'),
       'Process'
     )
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $setup
-    if ($LASTEXITCODE -ne 0) { Warn 'setup.ps1 reported problems (see above)' }
-    [Environment]::SetEnvironmentVariable('CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR', $previousPocketAssets, 'Process')
+    [Environment]::SetEnvironmentVariable('CORTEX_DATA_DIR', $DATA_DIR, 'Process')
+    try {
+      & powershell -NoProfile -ExecutionPolicy Bypass -File $setup
+      if ($LASTEXITCODE -ne 0) { Warn 'setup.ps1 reported problems (see above)' }
+    } finally {
+      [Environment]::SetEnvironmentVariable('CORTEX_DATA_DIR', $previousAppDataDir, 'Process')
+      [Environment]::SetEnvironmentVariable('CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR', $previousPocketAssets, 'Process')
+    }
   } else {
     Warn 'setup.ps1 not in support bundle - installing Node deps inline'
     Push-Location $DATA_DIR

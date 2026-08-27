@@ -1,12 +1,13 @@
 #!/bin/bash
-# Cortex — installer (public distribution, no token needed).
+# W3I — installer (public distribution, no token needed).
 #
 # By default this downloads the prebuilt .app anonymously from the PUBLIC
 # distribution repo's latest GitHub Release — no GitHub token required:
 #
 #   curl -fsSL https://raw.githubusercontent.com/appfactory123/w3i-dist/main/install.sh | bash
 #
-# Installs the app to /Applications, provisions a data dir (~/.cortex-ai-sessions)
+# Installs W3I beside Cortex at /Applications/W3I.app, provisions the isolated
+# data dir ~/.cortex-ai-sessions-w3i,
 # with the bot + support files, and installs every runtime library (Node deps
 # via Bun, Python cryptography/tls-client, a managed MLX-or-Whisper realtime
 # speech model, a managed local Pocket Jarvis voice, ffmpeg,
@@ -25,7 +26,7 @@
 #   CORTEX_SOURCE_REPO  override the authenticated private repo (owner/name).
 #   CORTEX_PUBLIC_REPO  override the public dist repo (owner/name).
 #   CORTEX_VERSION    pin a release tag (default: latest)
-#   CORTEX_LOCAL_DIR  install Cortex app/support artifacts from this directory
+#   CORTEX_LOCAL_DIR  install W3I app/support artifacts from this directory
 #                              instead of downloading them. Pocket's model
 #                              remains a fixed verified download unless it is
 #                              also present here — for testing; no token needed.
@@ -34,14 +35,12 @@ set -euo pipefail
 
 REPO="${CORTEX_SOURCE_REPO:-appfactory123/claude-sessions}"
 PUBLIC_REPO="${CORTEX_PUBLIC_REPO:-appfactory123/w3i-dist}"
-APP_NAME="Cortex"
+APP_NAME="W3I"
 APP_PATH="/Applications/${APP_NAME}.app"
-# Cortex Builder publishes a renamed build (customizeCortexDevelopAppIdentity in
-# the Cortex repository) so a development Cortex can sit beside the released one.
-# Those are two apps, so they get two data dirs: sharing one would mean sharing
+# Every packaged product gets a separate data dir: sharing one would mean sharing
 # settings.json, sessions.json and the bot's state. Re-derived from the bundle
-# that was actually downloaded, once its name is known; CORTEX_DATA_DIR pins it
-# for an in-app update, which already knows which app it is updating.
+# that was actually downloaded once its name is known; CORTEX_DATA_DIR pins it
+# for an in-app update, which already knows which product it is updating.
 app_data_dir() {
   local suffix
   suffix="$(printf '%s' "${1:-}" \
@@ -65,7 +64,7 @@ IN_APP_UPDATE="${CORTEX_IN_APP_UPDATE:-}"
 mkdir -p "$DATA_DIR"
 LOG_FILE="$DATA_DIR/install.log"
 exec > >(tee "$LOG_FILE") 2>&1
-echo "Cortex installer log — $(date)"
+echo "W3I installer log — $(date)"
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
@@ -578,7 +577,7 @@ ensure_node() {
   return 1
 }
 
-echo "Cortex — installer"
+echo "W3I — installer"
 
 # ── Preflight ───────────────────────────────────────────
 step "Preflight"
@@ -589,7 +588,7 @@ step "Preflight"
 if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
   ARCH="arm64"
 elif [ "$(uname -m)" = "x86_64" ]; then
-  ARCH="x64"
+  die "W3I currently supports Apple Silicon Macs only."
 else
   die "Unsupported architecture: $(uname -m)"
 fi
@@ -598,7 +597,7 @@ if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" = "1" ]; then
 fi
 ok "macOS / $ARCH"
 
-APP_ZIP="Cortex-${ARCH}.zip"
+APP_ZIP="W3I-${ARCH}.zip"
 SUPPORT_TAR="support.tar.gz"
 POCKET_MODEL_ASSET="Pocket-English-model.tar.gz"
 POCKET_MODEL_REPOSITORY="appfactory123/pocket-tts-model-weight-dist"
@@ -744,10 +743,9 @@ ok "downloaded $APP_ZIP"
 ditto -x -k "$WORK/$APP_ZIP" "$WORK/app" || die "could not unzip $APP_ZIP"
 SRC_APP="$(find "$WORK/app" -maxdepth 2 -name '*.app' -type d | head -n1)"
 [ -n "$SRC_APP" ] || die "no .app found inside $APP_ZIP"
-# A Develop build renames its bundle (customizeCortexDevelopAppIdentity in the
-# Cortex repository) so it can live beside the released Cortex. Install under the
-# name that was actually built: with the default name, that build replaces
-# /Applications/Cortex.app and the user loses the app they were already running.
+# Install under the name that was actually built. The W3I release archive must
+# contain W3I.app, so it lives beside /Applications/Cortex.app instead of
+# replacing the user's existing Cortex installation.
 APP_NAME="$(basename "$SRC_APP" .app)"
 APP_PATH="/Applications/${APP_NAME}.app"
 if [ -z "${CORTEX_DATA_DIR:-}" ]; then
@@ -911,7 +909,7 @@ refresh_grok_cli_home
 # Hugging Face model cannot be prepared. A speech failure must not prevent the
 # text application from installing; Live voice exposes the same repair action.
 step "Realtime speech model"
-STT_RUNTIME_DIR="$HOME/Library/Application Support/Cortex/voice-stt"
+STT_RUNTIME_DIR="$HOME/Library/Application Support/${APP_NAME}/voice-stt"
 STT_PROVISIONER="$APP_PATH/Contents/Resources/standalone/scripts/provision-realtime-stt.sh"
 STT_DAEMON="$APP_PATH/Contents/Resources/standalone/scripts/stt_daemon.py"
 STT_VOICE_TTS_PYTHON="$HOME/.cortex-ai-sessions/voice-tts/.venv/bin/python3"
