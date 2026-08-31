@@ -258,6 +258,25 @@ restore_preserved_config_lines() {
   done <<< "$saved"
 }
 
+# An in-app update relaunches the replacement bundle before the slower runtime
+# provisioning finishes. Canonicalize the one path Electron needs before that
+# relaunch, while preserving every user-owned override for setup.command to
+# reconcile later. The atomic same-directory replace also repairs legacy config
+# permissions without ever sourcing the file as shell code.
+canonicalize_runtime_project_config() {
+  local staged
+  staged="$(mktemp "${CONFIG}.runtime.XXXXXX")" || return 1
+  if [ -f "$CONFIG" ]; then
+    awk '!/^[[:space:]]*CORTEX_PROJECT_DIR[[:space:]]*=/' "$CONFIG" > "$staged" \
+      || { rm -f "$staged"; return 1; }
+  fi
+  printf 'CORTEX_PROJECT_DIR="%s"\n' "$DATA_DIR" >> "$staged" \
+    || { rm -f "$staged"; return 1; }
+  chmod 600 "$staged" \
+    && mv -f "$staged" "$CONFIG" \
+    || { rm -f "$staged"; return 1; }
+}
+
 refresh_grok_cli_home() {
   # xAI's installer stores auth/download metadata under ~/.grok even when its
   # GROK_BIN_DIR places the launcher in Cortex's configured provider home.
@@ -603,7 +622,7 @@ POCKET_MODEL_ASSET="Pocket-English-model.tar.gz"
 POCKET_MODEL_REPOSITORY="appfactory123/pocket-tts-model-weight-dist"
 POCKET_MODEL_RELEASE_TAG="pocket-tts-v2.1.0-english-1"
 POCKET_MODEL_RELEASE_ASSET_ID="494264404"
-POCKET_MODEL_ROOT="$HOME/.cortex-ai-sessions/voice-tts/pocket-model"
+POCKET_MODEL_ROOT="$DATA_DIR/voice-tts/pocket-model"
 POCKET_MODEL_SHA256="473f47d99560bd50eb8b4509d3cacfe7f316ab20bdca86505403a2e6a936a6e9"
 POCKET_TOKENIZER_SHA256="d461765ae179566678c93091c5fa6f2984c31bbe990bf1aa62d92c64d91bc3f6"
 
@@ -822,8 +841,13 @@ ok "extracted bot + support files"
 # the atomic bundle/support swap; the detached installer keeps running and the
 # relaunched app resumes progress from update.log while dependencies finish.
 if [ "$IN_APP_UPDATE" = "1" ]; then
-  relaunch_installed_app \
-    || warn "${APP_NAME} has not relaunched yet; the exit failsafe will retry"
+  if canonicalize_runtime_project_config; then
+    ok "prepared runtime config → $DATA_DIR"
+    relaunch_installed_app \
+      || warn "${APP_NAME} has not relaunched yet; the exit failsafe will retry"
+  else
+    warn "could not prepare $CONFIG; deferring relaunch until setup repairs it"
+  fi
 fi
 
 # ── Pocket release model ───────────────────────────────
@@ -885,7 +909,7 @@ ensure_node || warn "continuing without Node — npm-managed provider CLIs and n
 
 # ── Delegate Node + Python deps + config to setup.command ─
 # setup.command (run from the data dir) installs Node deps via bun, installs the
-# Python libs, and writes ~/.cortex-ai-sessions.env → the data dir. Reusing it keeps
+# Python libs, and writes ~/.cortex-ai-sessions-w3i.env → the data dir. Reusing it keeps
 # dependency logic in one place.
 step "Dependencies (delegating to setup.command)"
 # Snapshot config-file overrides before setup.command rewrites the shared config;
@@ -912,7 +936,7 @@ step "Realtime speech model"
 STT_RUNTIME_DIR="$HOME/Library/Application Support/${APP_NAME}/voice-stt"
 STT_PROVISIONER="$APP_PATH/Contents/Resources/standalone/scripts/provision-realtime-stt.sh"
 STT_DAEMON="$APP_PATH/Contents/Resources/standalone/scripts/stt_daemon.py"
-STT_VOICE_TTS_PYTHON="$HOME/.cortex-ai-sessions/voice-tts/.venv/bin/python3"
+STT_VOICE_TTS_PYTHON="$DATA_DIR/voice-tts/.venv/bin/python3"
 STT_CONFIG_TTS_PYTHON=""
 STT_CONFIG_PYTHON=""
 
@@ -998,7 +1022,7 @@ done
 
 # A clean Mac may have only Apple's older system Python. Bootstrap uv and its
 # architecture-native Python 3.12 as a final managed base instead of failing
-# the entire Cortex installation.
+# the entire W3I installation.
 if [ -z "$STT_BASE_PYTHON" ]; then
   STT_UV="$(command -v uv || true)"
   for candidate in "$STT_UV" "$HOME/.local/bin/uv" "$HOME/.cargo/bin/uv"; do
@@ -1050,7 +1074,7 @@ elif CORTEX_STT_ENGINE="$STT_ENGINE" bash "$STT_PROVISIONER" \
   STT_INSTALLED_ENGINE="$(awk -F= '$1 == "engine" { print $2; exit }' "$STT_RUNTIME_DIR/release-provisioned" 2>/dev/null || true)"
   ok "verified managed realtime speech (${STT_INSTALLED_ENGINE:-$STT_ENGINE})"
 else
-  warn "local speech provisioning failed; Cortex installed and Live voice can retry from the app"
+  warn "local speech provisioning failed; W3I installed and Live voice can retry from the app"
 fi
 
 # ── Managed local CLI updates ───────────────────────────
@@ -1158,7 +1182,7 @@ update_agy_cli() {
     warn "agy not found — installing the latest stable Antigravity CLI…"
     run_vendor_bash_installer "Antigravity-CLI" https://antigravity.google/cli/install.sh \
       && ok "Antigravity CLI installed via the official installer" \
-      || warn "Antigravity CLI install failed — keeping Cortex installation running"
+      || warn "Antigravity CLI install failed — keeping W3I installation running"
   elif cli_is_agy_native "$bin"; then
     # The vendor's bootstrap script deliberately does not replace a preexisting
     # agy binary; its native updater is the supported rerun/update mechanism.
@@ -1187,7 +1211,7 @@ update_grok_cli() {
     GROK_CHANNEL=stable GROK_BIN_DIR="$GROK_CLI_BIN_DIR" \
       run_vendor_bash_installer "Grok-CLI" https://x.ai/cli/install.sh \
       && ok "Grok CLI installed via the official installer" \
-      || warn "Grok CLI install failed — keeping Cortex installation running"
+      || warn "Grok CLI install failed — keeping W3I installation running"
   elif cli_is_npm_managed "$bin" '@xai-official/grok'; then
     warn "updating npm-managed Grok CLI…"
     npm install -g '@xai-official/grok@latest' </dev/null \
@@ -1322,6 +1346,10 @@ echo "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 echo "  Install log:      $LOG_FILE"
 echo
 if [ "$IN_APP_UPDATE" = "1" ]; then
+  canonicalize_runtime_project_config || {
+    APP_RELAUNCH_REQUIRED=""
+    die "the update finished, but $CONFIG could not be prepared safely; launch ${APP_NAME} after repairing that file"
+  }
   relaunch_installed_app \
     || die "the update finished, but ${APP_NAME} could not be relaunched automatically"
 else
