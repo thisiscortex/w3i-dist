@@ -52,6 +52,32 @@ function Warn ($m) { Write-Host "  ! $m"               -ForegroundColor Yellow }
 function Step ($m) { Write-Host ""; Write-Host "$([char]0x25B6) $m" -ForegroundColor White }  # drives the GUI progress bar
 function Die  ($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; exit 1 }
 
+# Run an advisory native command and return only its exit code.
+#
+# While $ErrorActionPreference is 'Stop' (set above), Windows PowerShell turns a
+# native command's *stderr writes* into a terminating NativeCommandError, and
+# "2>$null" does not prevent that. Selftests and winget report progress and
+# failures on stderr, so calling them directly aborted the whole install at
+# checks this script deliberately treats as non-fatal. Relax the preference for
+# the call, swallow any error record, and let the exit code be the only verdict.
+function Invoke-NativeSoft {
+  param(
+    [Parameter(Mandatory)][string]$FilePath,
+    [string[]]$Arguments = @()
+  )
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $FilePath @Arguments 2>&1 | Out-Null
+    if ($null -eq $LASTEXITCODE) { return 0 }
+    return $LASTEXITCODE
+  } catch {
+    return 1
+  } finally {
+    $ErrorActionPreference = $previous
+  }
+}
+
 Write-Host "W3I - installer"
 
 # -- Preflight ---------------------------------------------------------------
@@ -690,7 +716,7 @@ try {
     # Fall back to winget if the web installer didn't land bun on PATH.
     if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
       Warn 'trying winget (Oven-sh.Bun)...'
-      & winget install --id Oven-sh.Bun -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
+      Invoke-NativeSoft -FilePath 'winget' -Arguments @('install', '--id', 'Oven-sh.Bun', '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') | Out-Null
       Sync-Path
     }
     # The installer drops bun.exe under ~\.bun\bin even when PATH isn't refreshed
@@ -910,8 +936,8 @@ try {
     } else { Warn 'codex CLI missing - skipped stale Codex registration cleanup' }
     $selftest = Join-Path $DATA_DIR 'scripts\computer-mcp\selftest.mjs'
     if (Test-Path $selftest) {
-      & $nodeCmd $selftest --node $nodeCmd --server $mcpServer 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) { Ok 'computer-control selftest passed' }
+      $selftestExit = Invoke-NativeSoft -FilePath $nodeCmd -Arguments @($selftest, '--node', $nodeCmd, '--server', $mcpServer)
+      if ($selftestExit -eq 0) { Ok 'computer-control selftest passed' }
       else { Warn 'computer-control selftest failed - live tool calls need attention' }
     } else { Warn 'selftest.mjs missing - could not verify live computer-control tool calls' }
   }
@@ -936,8 +962,8 @@ try {
     } else {
       $obsidianSelftest = Join-Path $DATA_DIR 'scripts\obsidian-mcp\selftest.mjs'
       if (Test-Path $obsidianSelftest) {
-        & $nodeCmd $obsidianSelftest $obsidianMcpServer 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { Ok 'Obsidian MCP selftest passed' }
+        $obsidianSelftestExit = Invoke-NativeSoft -FilePath $nodeCmd -Arguments @($obsidianSelftest, $obsidianMcpServer)
+        if ($obsidianSelftestExit -eq 0) { Ok 'Obsidian MCP selftest passed' }
         else { Warn 'Obsidian MCP selftest failed - the Obsidian app must be running with a vault open' }
       } else { Warn 'selftest.mjs missing - could not verify live Obsidian tool calls' }
     }
@@ -954,7 +980,7 @@ try {
     Ok 'Google Chrome installed'
   } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
     Warn 'Google Chrome not found - installing via winget...'
-    & winget install --id Google.Chrome -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
+    Invoke-NativeSoft -FilePath 'winget' -Arguments @('install', '--id', 'Google.Chrome', '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') | Out-Null
     if ($chromePaths | Where-Object { Test-Path $_ }) { Ok 'Google Chrome installed' }
     else { Warn 'install failed - install manually (https://www.google.com/chrome/); needed for the WhatsApp bot.' }
   } else {
