@@ -646,10 +646,22 @@ try {
     $pocketStage = Join-Path $pocketModelDir ('.release-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $pocketStage | Out-Null
     $pocketContents = @(& tar.exe -tzf $pocketArchive)
-    if ($LASTEXITCODE -ne 0 -or $pocketContents.Count -ne 2 -or $pocketContents[0] -ne 'model.safetensors' -or $pocketContents[1] -ne 'tokenizer.model') {
+    if ($LASTEXITCODE -ne 0) { Die "could not inspect $POCKET_MODEL_ASSET" }
+    # The archive is rolled on macOS, where BSD tar stores extended attributes
+    # as AppleDouble "._<name>" sibling entries. macOS tar merges those back
+    # when reading, so install.sh only ever sees the two payload members, but
+    # Windows tar.exe lists them verbatim. Allow exactly those siblings and
+    # nothing else, and require both payload members; the pinned SHA-256 checks
+    # below remain the trust boundary.
+    $pocketExpected = @('model.safetensors', 'tokenizer.model')
+    $pocketAllowed = $pocketExpected + ($pocketExpected | ForEach-Object { "._$_" })
+    $pocketUnexpected = @($pocketContents | Where-Object { $pocketAllowed -notcontains $_ })
+    $pocketPayload = @($pocketContents | Where-Object { $pocketExpected -contains $_ } | Sort-Object -Unique)
+    if ($pocketUnexpected.Count -ne 0 -or $pocketPayload.Count -ne $pocketExpected.Count) {
       Die "$POCKET_MODEL_ASSET has unexpected contents"
     }
-    & tar.exe -xzf $pocketArchive -C $pocketStage
+    # Name the members explicitly so the AppleDouble stubs are never written.
+    & tar.exe -xzf $pocketArchive -C $pocketStage $pocketExpected
     if ($LASTEXITCODE -ne 0 -or -not (Test-PocketReleaseModel -Directory $pocketStage)) {
       Die "$POCKET_MODEL_ASSET failed checksum verification"
     }
