@@ -748,6 +748,21 @@ dl() {
   fi
 }
 
+# Download both independent update artifacts while the old app stays usable.
+# Wait for BOTH children even after a failure, so cleanup never removes WORK
+# underneath an active transfer. dl retains its local/public/token branches,
+# resume/retry behavior, and the artifact-specific failure message in the log.
+download_update_assets() {
+  local app_pid support_pid app_status=0 support_status=0
+  dl "$APP_ZIP" "$WORK/$APP_ZIP" &
+  app_pid=$!
+  dl "$SUPPORT_TAR" "$WORK/$SUPPORT_TAR" &
+  support_pid=$!
+  wait "$app_pid" || app_status=$?
+  wait "$support_pid" || support_status=$?
+  [ "$app_status" -eq 0 ] && [ "$support_status" -eq 0 ]
+}
+
 # dl_pocket_model <dest> — Pocket's immutable public release is deliberately
 # separate from each Cortex app release. This keeps the large weight asset out
 # of app updates while the pinned release asset and file checksums keep the
@@ -772,7 +787,7 @@ dl_pocket_model() {
 
 # ── Prepare update assets while the old app remains usable ───────────────
 step "Preparing update assets"
-dl "$APP_ZIP" "$WORK/$APP_ZIP"
+download_update_assets || exit 1
 ok "downloaded $APP_ZIP"
 ditto -x -k "$WORK/$APP_ZIP" "$WORK/app" || die "could not unzip $APP_ZIP"
 SRC_APP="$(find "$WORK/app" -maxdepth 2 -name '*.app' -type d | head -n1)"
@@ -788,7 +803,6 @@ if [ -z "${CORTEX_DATA_DIR:-}" ]; then
   CONFIG="$DATA_DIR.env"
   mkdir -p "$DATA_DIR"
 fi
-dl "$SUPPORT_TAR" "$WORK/$SUPPORT_TAR"
 mkdir -p "$WORK/support"
 tar -xzf "$WORK/$SUPPORT_TAR" -C "$WORK/support" || die "could not extract $SUPPORT_TAR"
 ok "prepared app + support files"
@@ -878,6 +892,7 @@ pocket_release_model_ready() {
     && pocket_file_matches "$POCKET_MODEL_ROOT/tokenizer.model" "$POCKET_TOKENIZER_SHA256"
 }
 
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ]; then
 step "Pocket voice model"
 if pocket_release_model_ready; then
   ok "verified Pocket model already installed"
@@ -904,6 +919,7 @@ else
     || die "could not install the verified Pocket model"
   chmod 600 "$POCKET_MODEL_ROOT/model.safetensors" "$POCKET_MODEL_ROOT/tokenizer.model" 2>/dev/null || true
   ok "downloaded and verified Pocket model"
+fi
 fi
 
 # ── Bun (required for Node deps + the bot) ──────────────
@@ -937,7 +953,7 @@ refresh_grok_cli_home
   CORTEX_RELEASE_INSTALL=1 \
   CORTEX_DATA_DIR="$DATA_DIR" \
   CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR="$APP_PATH/Contents/Resources/standalone/scripts/voice-assets" \
-  bash setup.command ) || warn "setup.command reported problems (see above)"
+  bash setup.command ) || die "setup.command failed; support runtime was not activated (see above)"
 restore_preserved_config_lines "$PRESERVED_CONFIG_BACKUP"
 load_cli_overrides_from_config
 refresh_grok_cli_home
@@ -947,6 +963,7 @@ refresh_grok_cli_home
 # then installs OpenAI Whisper in the same managed runtime if MLX's package or
 # Hugging Face model cannot be prepared. A speech failure must not prevent the
 # text application from installing; Live voice exposes the same repair action.
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ]; then
 step "Realtime speech model"
 STT_RUNTIME_DIR="$HOME/Library/Application Support/${APP_NAME}/voice-stt"
 STT_PROVISIONER="$APP_PATH/Contents/Resources/standalone/scripts/provision-realtime-stt.sh"
@@ -1090,6 +1107,7 @@ elif CORTEX_STT_ENGINE="$STT_ENGINE" bash "$STT_PROVISIONER" \
   ok "verified managed realtime speech (${STT_INSTALLED_ENGINE:-$STT_ENGINE})"
 else
   warn "local speech provisioning failed; W3I installed and Live voice can retry from the app"
+fi
 fi
 
 # ── Managed local CLI updates ───────────────────────────
@@ -1394,7 +1412,7 @@ echo
 ok "Install complete."
 echo
 echo "  Launch the app:   open \"$APP_PATH\""
-echo "  WhatsApp bot:     open \"$DATA_DIR/start-bot.command\""
+echo "  WhatsApp bot:     install WhatsApp Accountant from the Cortex App Store"
 echo "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 echo "  Install log:      $LOG_FILE"
 echo

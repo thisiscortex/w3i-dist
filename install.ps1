@@ -4,7 +4,7 @@
 # Windows build anonymously from the PUBLIC distribution repo's latest GitHub
 # Release - no GitHub token required:
 #
-#   irm https://raw.githubusercontent.com/appfactory123/w3i-dist/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/thisiscortex/w3i-dist/main/install.ps1 | iex
 #
 # Installs the app beside Cortex at %LOCALAPPDATA%\Programs\W3I (with Start Menu
 # + Desktop shortcuts), provisions %USERPROFILE%\.cortex-ai-sessions-w3i with the
@@ -38,7 +38,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 
 # -- Config ------------------------------------------------------------------
 $REPO        = 'appfactory123/claude-sessions'
-$PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'appfactory123/w3i-dist' }
+$PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { 'thisiscortex/w3i-dist' }
 $APP_NAME    = 'W3I'
 $INSTALL_DIR = Join-Path $env:LOCALAPPDATA 'Programs\W3I'
 $APP_EXE     = Join-Path $INSTALL_DIR "$APP_NAME.exe"
@@ -51,32 +51,6 @@ function Ok   ($m) { Write-Host "  $([char]0x2713) $m" -ForegroundColor Green }
 function Warn ($m) { Write-Host "  ! $m"               -ForegroundColor Yellow }
 function Step ($m) { Write-Host ""; Write-Host "$([char]0x25B6) $m" -ForegroundColor White }  # drives the GUI progress bar
 function Die  ($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; exit 1 }
-
-# Run an advisory native command and return only its exit code.
-#
-# While $ErrorActionPreference is 'Stop' (set above), Windows PowerShell turns a
-# native command's *stderr writes* into a terminating NativeCommandError, and
-# "2>$null" does not prevent that. Selftests and winget report progress and
-# failures on stderr, so calling them directly aborted the whole install at
-# checks this script deliberately treats as non-fatal. Relax the preference for
-# the call, swallow any error record, and let the exit code be the only verdict.
-function Invoke-NativeSoft {
-  param(
-    [Parameter(Mandatory)][string]$FilePath,
-    [string[]]$Arguments = @()
-  )
-  $previous = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try {
-    & $FilePath @Arguments 2>&1 | Out-Null
-    if ($null -eq $LASTEXITCODE) { return 0 }
-    return $LASTEXITCODE
-  } catch {
-    return 1
-  } finally {
-    $ErrorActionPreference = $previous
-  }
-}
 
 Write-Host "W3I - installer"
 
@@ -613,15 +587,30 @@ try {
   Ok "installed -> $INSTALL_DIR"
 
   # Start Menu + Desktop shortcuts.
+  $displayName = $APP_NAME
+  $profilePath = Join-Path $INSTALL_DIR 'resources\product-profile.json'
+  if (Test-Path $profilePath) {
+    try {
+      $profile = Get-Content $profilePath -Raw | ConvertFrom-Json
+      if ($profile.marketingName) { $displayName = [string]$profile.marketingName }
+    } catch { Warn 'could not read packaged display name; using executable name for shortcuts' }
+  }
   $ws = New-Object -ComObject WScript.Shell
   $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
   foreach ($lnkDir in @($startMenu, [Environment]::GetFolderPath('Desktop'))) {
     try {
-      $lnk = $ws.CreateShortcut((Join-Path $lnkDir "$APP_NAME.lnk"))
+      $lnk = $ws.CreateShortcut((Join-Path $lnkDir "$displayName.lnk"))
       $lnk.TargetPath = $APP_EXE
       $lnk.WorkingDirectory = $INSTALL_DIR
       $lnk.IconLocation = $APP_EXE
       $lnk.Save()
+      if ($displayName -ne $APP_NAME) {
+        $oldPath = Join-Path $lnkDir "$APP_NAME.lnk"
+        if (Test-Path $oldPath) {
+          $oldShortcut = $ws.CreateShortcut($oldPath)
+          if ($oldShortcut.TargetPath -eq $APP_EXE) { Remove-Item $oldPath -Force }
+        }
+      }
     } catch {}
   }
   Ok 'created Start Menu + Desktop shortcuts'
@@ -651,6 +640,7 @@ try {
   # The model stays a distinct, versioned GitHub Release asset. It is not part
   # of the app archive or Git history; exact SHA-256 checks gate installation
   # and Pocket runs offline after this point.
+  if ($env:CORTEX_INSTALL_LOCAL_VOICE -eq '1') {
   Step 'Pocket voice model'
   $pocketModelDir = Join-Path $DATA_DIR 'voice-tts\pocket-model'
   if (Test-PocketReleaseModel -Directory $pocketModelDir) {
@@ -699,6 +689,7 @@ try {
     }
     Ok 'downloaded and verified Pocket model'
   }
+  }
 
   # -- Bun (powers the WhatsApp bot + data-dir Node deps) --------------------
   # NOT required for the main app - the packaged build bundles its own
@@ -716,7 +707,7 @@ try {
     # Fall back to winget if the web installer didn't land bun on PATH.
     if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
       Warn 'trying winget (Oven-sh.Bun)...'
-      Invoke-NativeSoft -FilePath 'winget' -Arguments @('install', '--id', 'Oven-sh.Bun', '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') | Out-Null
+      & winget install --id Oven-sh.Bun -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
       Sync-Path
     }
     # The installer drops bun.exe under ~\.bun\bin even when PATH isn't refreshed
@@ -936,36 +927,37 @@ try {
     } else { Warn 'codex CLI missing - skipped stale Codex registration cleanup' }
     $selftest = Join-Path $DATA_DIR 'scripts\computer-mcp\selftest.mjs'
     if (Test-Path $selftest) {
-      $selftestExit = Invoke-NativeSoft -FilePath $nodeCmd -Arguments @($selftest, '--node', $nodeCmd, '--server', $mcpServer)
-      if ($selftestExit -eq 0) { Ok 'computer-control selftest passed' }
+      & $nodeCmd $selftest --node $nodeCmd --server $mcpServer 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) { Ok 'computer-control selftest passed' }
       else { Warn 'computer-control selftest failed - live tool calls need attention' }
     } else { Warn 'selftest.mjs missing - could not verify live computer-control tool calls' }
   }
 
-  # -- Obsidian MCP server (vault read/write for agent sessions) -------------
-  Step 'Obsidian MCP server'
-  $obsidianMcpServer = Join-Path $DATA_DIR 'scripts\obsidian-mcp\server.mjs'
-  if (-not (Test-Path $obsidianMcpServer)) {
-    Warn 'server.mjs not in support bundle - skipping Obsidian MCP selftest'
+  # -- Obsidian skills (vault access for agent sessions) ---------------------
+  # Claude loads the vendored kepano/obsidian-skills per session; Codex reads
+  # skills only from CODEX_HOME. Also remove stale global MCP registrations.
+  Step 'Obsidian skills'
+  $obsidianSkillsInstaller = Join-Path $DATA_DIR 'scripts\obsidian-skills\install.mjs'
+  if (-not (Test-Path $obsidianSkillsInstaller)) {
+    Warn 'obsidian-skills not in support bundle - skipping Obsidian skills install'
   } else {
     if (Get-Command claude -ErrorAction SilentlyContinue) {
       try { & claude mcp remove -s user obsidian 2>$null | Out-Null } catch {}
       try { & claude mcp remove -s local obsidian 2>$null | Out-Null } catch {}
-      Ok 'removed stale Claude obsidian registration'
-    } else { Warn 'claude CLI missing - skipped stale Claude registration cleanup' }
+    }
     if (Get-Command codex -ErrorAction SilentlyContinue) {
       try { & codex mcp remove obsidian 2>$null | Out-Null } catch {}
-      Ok 'removed stale Codex obsidian registration'
-    } else { Warn 'codex CLI missing - skipped stale Codex registration cleanup' }
+    }
+    $codexHomeDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+    & $nodeCmd $obsidianSkillsInstaller (Join-Path $codexHomeDir 'skills') 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok 'Obsidian skills installed for Codex' }
+    else { Warn "could not install Obsidian skills into $codexHomeDir\skills" }
     if (-not (Get-Command obsidian -ErrorAction SilentlyContinue)) {
       Warn 'obsidian CLI not found - install Obsidian >=1.12 and enable it (Settings > General > Command line interface)'
     } else {
-      $obsidianSelftest = Join-Path $DATA_DIR 'scripts\obsidian-mcp\selftest.mjs'
-      if (Test-Path $obsidianSelftest) {
-        $obsidianSelftestExit = Invoke-NativeSoft -FilePath $nodeCmd -Arguments @($obsidianSelftest, $obsidianMcpServer)
-        if ($obsidianSelftestExit -eq 0) { Ok 'Obsidian MCP selftest passed' }
-        else { Warn 'Obsidian MCP selftest failed - the Obsidian app must be running with a vault open' }
-      } else { Warn 'selftest.mjs missing - could not verify live Obsidian tool calls' }
+      & obsidian vaults 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) { Ok 'obsidian CLI reachable' }
+      else { Warn 'obsidian CLI could not reach the app - Obsidian must be running when a session uses it' }
     }
   }
 
@@ -980,7 +972,7 @@ try {
     Ok 'Google Chrome installed'
   } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
     Warn 'Google Chrome not found - installing via winget...'
-    Invoke-NativeSoft -FilePath 'winget' -Arguments @('install', '--id', 'Google.Chrome', '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements') | Out-Null
+    & winget install --id Google.Chrome -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
     if ($chromePaths | Where-Object { Test-Path $_ }) { Ok 'Google Chrome installed' }
     else { Warn 'install failed - install manually (https://www.google.com/chrome/); needed for the WhatsApp bot.' }
   } else {
@@ -1005,7 +997,7 @@ Write-Host ""
 Ok 'Install complete.'
 Write-Host ""
 Write-Host "  Launch the app:   $APP_EXE"
-Write-Host "  WhatsApp bot:     $DATA_DIR\start-bot.cmd"
+Write-Host "  WhatsApp bot:     install WhatsApp Accountant from the Cortex App Store"
 Write-Host "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 Write-Host ""
 try { Start-Process $APP_EXE } catch {}
