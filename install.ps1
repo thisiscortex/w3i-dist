@@ -4,7 +4,8 @@
 # Windows build anonymously from the PUBLIC distribution repo's newest stable
 # release with complete Windows assets - no GitHub token required:
 #
-#   irm https://raw.githubusercontent.com/thisiscortex/w3i-dist/main/install.ps1 | iex
+# Prefer the graphical installer, which embeds this reviewed script. Direct
+# script users download a local copy and run it with PowerShell -File.
 #
 # Installs the app beside Cortex at %LOCALAPPDATA%\Programs\W3I (with Start Menu
 # + Desktop shortcuts), provisions %USERPROFILE%\.cortex-ai-sessions-w3i with the
@@ -46,13 +47,38 @@ $DATA_DIR    = if ($env:CORTEX_DATA_DIR) { [System.IO.Path]::GetFullPath($env:CO
 $CONFIG      = "$DATA_DIR.env"
 $TOKEN       = if ($env:CORTEX_TOKEN) { $env:CORTEX_TOKEN } elseif ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
 
+# The graphical installer supplies its embedded, build-selected profile. A
+# source checkout can use APP_PRODUCT_ID; raw legacy W3I scripts retain the
+# defaults above when no profile is available.
+$installerProfilePath = $env:CORTEX_INSTALL_PROFILE
+if (-not $installerProfilePath -and $PSScriptRoot) {
+  $installerProductId = if ($env:APP_PRODUCT_ID) { $env:APP_PRODUCT_ID } else { 'w3i' }
+  if ($installerProductId -notin @('cortex', 'w3i')) { throw 'Unsupported installer product.' }
+  $candidateProfile = Join-Path $PSScriptRoot "products\$installerProductId\profile.json"
+  if (Test-Path -LiteralPath $candidateProfile -PathType Leaf) { $installerProfilePath = $candidateProfile }
+}
+$installerProfile = $null
+if ($installerProfilePath) {
+  $installerProfile = Get-Content -LiteralPath $installerProfilePath -Raw | ConvertFrom-Json
+  if ($installerProfile.id -notin @('cortex', 'w3i') -or
+      $installerProfile.productName -notmatch '^[A-Za-z0-9 ]+$' -or
+      $installerProfile.stateDirectoryName -notmatch '^\.[A-Za-z0-9-]+$') { throw 'Invalid installer product profile.' }
+  $APP_NAME = $installerProfile.productName
+  $PUBLIC_REPO = if ($env:CORTEX_PUBLIC_REPO) { $env:CORTEX_PUBLIC_REPO } else { $installerProfile.release.distributionRepository }
+  $INSTALL_DIR = Join-Path $env:LOCALAPPDATA "Programs\$APP_NAME"
+  $APP_EXE = Join-Path $INSTALL_DIR "$APP_NAME.exe"
+  $DATA_DIR = if ($env:CORTEX_DATA_DIR) { [IO.Path]::GetFullPath($env:CORTEX_DATA_DIR) } else { Join-Path $env:USERPROFILE $installerProfile.stateDirectoryName }
+  $CONFIG = Join-Path $env:USERPROFILE ($installerProfile.stateDirectoryName + '.env')
+}
+if ($env:CORTEX_INSTALL_CONFIG) { $CONFIG = [IO.Path]::GetFullPath($env:CORTEX_INSTALL_CONFIG) }
+
 # -- Pretty output (mirrors install.sh's ok/warn/step/die) -------------------
 function Ok   ($m) { Write-Host "  $([char]0x2713) $m" -ForegroundColor Green }
 function Warn ($m) { Write-Host "  ! $m"               -ForegroundColor Yellow }
 function Step ($m) { Write-Host ""; Write-Host "$([char]0x25B6) $m" -ForegroundColor White }  # drives the GUI progress bar
 function Die  ($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; exit 1 }
 
-Write-Host "W3I - installer"
+Write-Host "$APP_NAME - installer"
 
 # -- Preflight ---------------------------------------------------------------
 Step 'Preflight'
@@ -67,34 +93,59 @@ switch ($rawArch) {
 }
 Ok "Windows / $ARCH"
 
-$APP_ZIP     = "W3I-win-$ARCH.zip"
+$APP_ZIP     = if ($installerProfile -and $ARCH -eq 'x64') { $installerProfile.release.windowsX64Artifact } else { "$APP_NAME-win-$ARCH.zip" }
 $SUPPORT_TAR = 'support.tar.gz'
 $POCKET_MODEL_ASSET = 'Pocket-English-model.tar.gz'
 $POCKET_MODEL_REPOSITORY = 'appfactory123/pocket-tts-model-weight-dist'
 $POCKET_MODEL_RELEASE_TAG = 'pocket-tts-v2.1.0-english-1'
-$POCKET_MODEL_RELEASE_ASSET_ID = '494264404'
+$POCKET_MODEL_ARCHIVE_SHA256 = 'f860e83a96349ea3d7cae1be278cc13af45a88f4be65eab2157d0030bb089dea'
 $POCKET_MODEL_SHA256 = '473f47d99560bd50eb8b4509d3cacfe7f316ab20bdca86505403a2e6a936a6e9'
 $POCKET_TOKENIZER_SHA256 = 'd461765ae179566678c93091c5fa6f2984c31bbe990bf1aa62d92c64d91bc3f6'
 $WORK = Join-Path ([System.IO.Path]::GetTempPath()) ("cortex-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 
-# GitHub's overall latest release may contain only macOS artifacts. Keep the
-# app and support bundle together; skip drafts, prereleases and partial uploads.
-function Get-WindowsRelease ($repository, $headers) {
-  $required = @($APP_ZIP, $SUPPORT_TAR, 'install.ps1')
-  for ($page = 1; ; $page++) {
-    # Invoke-RestMethod emits the JSON array as one pipeline object. Assign it
-    # before wrapping it, otherwise foreach sees the entire page as one release.
-    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases?per_page=100&page=$page" -Headers $headers -TimeoutSec 15
-    $releases = @($releases)
-    foreach ($release in $releases) {
-      if ($release.draft -ne $false -or $release.prerelease -ne $false -or [string]::IsNullOrWhiteSpace($release.tag_name)) { continue }
-      $names = @($release.assets | Where-Object { $_.state -eq 'uploaded' } | ForEach-Object { $_.name })
-      $missing = @($required | Where-Object { $names -cnotcontains $_ })
-      if ($missing.Count -eq 0) { return $release }
-    }
-    if ($releases.Count -lt 100) { return $null }
+# A complete Windows release must contain one uploaded app, support bundle and
+# installer script. GitHub's server-calculated SHA-256 digest is required before
+# accepting any release payload; a partial upload or macOS-only tag is skipped.
+function Test-WindowsRelease {
+  param($Release, [string[]]$RequiredAssets)
+  if ($Release.draft -or $Release.prerelease) { return $false }
+  foreach ($requiredAsset in $RequiredAssets) {
+    $matches = @($Release.assets | Where-Object { $_.name -eq $requiredAsset })
+    if ($matches.Count -ne 1 -or $matches[0].state -ne 'uploaded' -or
+        $matches[0].size -le 0 -or [string]$matches[0].digest -notmatch '^sha256:[0-9a-fA-F]{64}$') { return $false }
   }
+  return $true
+}
+
+function Get-WindowsRelease {
+  param([string]$Repository, [string[]]$RequiredAssets, [string]$Tag = '', [hashtable]$Headers = @{})
+  if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid release repository.' }
+  $requestHeaders = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'cortex-windows-installer' }
+  foreach ($key in $Headers.Keys) { $requestHeaders[$key] = $Headers[$key] }
+  if ($Tag) {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/tags/$([Uri]::EscapeDataString($Tag))" -Headers $requestHeaders -TimeoutSec 15
+    if (-not (Test-WindowsRelease $release $RequiredAssets)) { throw "Release $Tag is not a complete stable Windows release with SHA-256 metadata." }
+    return $release
+  }
+  for ($page = 1; $page -le 20; $page++) {
+    # Invoke-RestMethod emits a JSON array as one pipeline object. Assign first
+    # so foreach enumerates releases rather than inspecting the whole array.
+    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases?per_page=100&page=$page" -Headers $requestHeaders -TimeoutSec 15
+    foreach ($release in @($releases)) {
+      if (Test-WindowsRelease $release $RequiredAssets) { return $release }
+    }
+    if (@($releases).Count -lt 100) { break }
+  }
+  throw "No complete stable Windows release found in $Repository."
+}
+
+function Assert-InstallerArtifact {
+  param([string]$Path, [string]$ExpectedHash, [long]$ExpectedSize = 0)
+  if ($ExpectedHash -notmatch '^[0-9a-fA-F]{64}$') { throw "Missing SHA-256 for $([IO.Path]::GetFileName($Path))." }
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Downloaded file is missing: $([IO.Path]::GetFileName($Path))" }
+  if ($ExpectedSize -gt 0 -and (Get-Item -LiteralPath $Path).Length -ne $ExpectedSize) { throw "Downloaded file size mismatch: $([IO.Path]::GetFileName($Path))" }
+  if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $ExpectedHash) { throw "Downloaded file SHA-256 mismatch: $([IO.Path]::GetFileName($Path))" }
 }
 
 # -- Locate the release (skipped in local mode) ------------------------------
@@ -108,26 +159,16 @@ if (-not $env:CORTEX_LOCAL_DIR) {
     $SOURCE_REPO = $REPO
     $headers = @{ Authorization = "Bearer $TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'cortex-installer' }
     try {
-      if ($env:CORTEX_VERSION) {
-        $ref = [Uri]::EscapeDataString($env:CORTEX_VERSION)
-        $REL_JSON = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/tags/$ref" -Headers $headers -TimeoutSec 15
-      } else {
-        $REL_JSON = Get-WindowsRelease $REPO $headers
-      }
+      $REL_JSON = Get-WindowsRelease -Repository $REPO -RequiredAssets @($APP_ZIP, $SUPPORT_TAR, 'install.ps1') -Tag $env:CORTEX_VERSION -Headers $headers
     } catch {
-      Die "Could not fetch the release from $REPO (bad token, no read access, or no release published yet)."
+      Die "Could not select a verified Windows release from $REPO. $($_.Exception.Message)"
     }
     if (-not $REL_JSON) { Die "No stable release with complete Windows assets is available in $REPO." }
     $TAG = $REL_JSON.tag_name
   }
-  elseif ($env:CORTEX_VERSION) {
-    $TAG = $env:CORTEX_VERSION
-  }
   else {
-    $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'cortex-installer' }
-    try { $REL_JSON = Get-WindowsRelease $PUBLIC_REPO $headers }
-    catch { Die "Could not list Windows releases from $PUBLIC_REPO (network or GitHub API rate limit). $($_.Exception.Message)" }
-    if (-not $REL_JSON) { Die "No stable release with complete Windows assets is available in $PUBLIC_REPO." }
+    try { $REL_JSON = Get-WindowsRelease -Repository $PUBLIC_REPO -RequiredAssets @($APP_ZIP, $SUPPORT_TAR, 'install.ps1') -Tag $env:CORTEX_VERSION }
+    catch { Die "Could not select a verified Windows release from $PUBLIC_REPO. $($_.Exception.Message)" }
     $TAG = $REL_JSON.tag_name
   }
   Ok "release $(if ($TAG) { $TAG } else { '?' }) ($SOURCE_REPO)"
@@ -139,39 +180,54 @@ function Dl ($name, $dest) {
   if ($env:CORTEX_LOCAL_DIR) {
     $src = Join-Path $env:CORTEX_LOCAL_DIR $name
     if (-not (Test-Path $src)) { Die "missing local artifact: $src" }
-    Copy-Item $src $dest -Force
+    $localManifestPath = Join-Path $env:CORTEX_LOCAL_DIR 'installer-artifacts.json'
+    if (-not (Test-Path -LiteralPath $localManifestPath -PathType Leaf)) { Die 'Local install requires installer-artifacts.json with SHA-256 checksums.' }
+    $localManifest = Get-Content -LiteralPath $localManifestPath -Raw | ConvertFrom-Json
+    $localHash = [string]$localManifest.PSObject.Properties[$name].Value
+    try { Assert-InstallerArtifact -Path $src -ExpectedHash $localHash } catch { Die $_.Exception.Message }
+    Copy-Item -LiteralPath $src -Destination $dest -Force
+    try { Assert-InstallerArtifact -Path $dest -ExpectedHash $localHash } catch { Die $_.Exception.Message }
   }
   elseif ($TOKEN) {
     $asset = $REL_JSON.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
     if (-not $asset) { Die "release $(if ($TAG) { $TAG } else { '?' }) has no asset named $name" }
     $headers = @{ Authorization = "Bearer $TOKEN"; Accept = 'application/octet-stream'; 'User-Agent' = 'cortex-installer' }
     try { Invoke-WebRequest -Uri "https://api.github.com/repos/$REPO/releases/assets/$($asset.id)" -Headers $headers -OutFile $dest }
-    catch { Die "download failed: $name" }
+    catch { Die "download failed: $name. Check your network or Windows Security Protection history. $($_.Exception.Message)" }
   }
   else {
-    $encodedTag = [Uri]::EscapeDataString($TAG)
-    $url = "https://github.com/$PUBLIC_REPO/releases/download/$encodedTag/$name"
+    $asset = $REL_JSON.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+    if (-not $asset) { Die "release $TAG has no asset named $name" }
+    $url = "https://github.com/$PUBLIC_REPO/releases/download/$([Uri]::EscapeDataString($TAG))/$([Uri]::EscapeDataString($name))"
     try { Invoke-WebRequest -Uri $url -OutFile $dest }
-    catch { Die "download failed: $name" }
+    catch { Die "download failed: $name. Check your network or Windows Security Protection history. $($_.Exception.Message)" }
+  }
+  if (-not $env:CORTEX_LOCAL_DIR) {
+    try { Assert-InstallerArtifact -Path $dest -ExpectedHash ([string]$asset.digest).Substring(7) -ExpectedSize $asset.size }
+    catch { Die $_.Exception.Message }
+    Ok "verified SHA-256: $name"
   }
 }
 
 # Dl-PocketModel <dest> - The Pocket weights live in their own immutable public
 # release, so Cortex app releases do not duplicate the large asset. GitHub's
-# public asset API resolves the pinned asset to a short-lived storage redirect;
-# hash checks below remain the final trust boundary. Local installer tests may
+# immutable public release URL is checked against a pinned archive hash;
+# model-file hash checks remain the final trust boundary. Local installer tests may
 # supply the archive next to the app artifacts.
 function Dl-PocketModel ($dest) {
   if ($env:CORTEX_LOCAL_DIR) {
     $local = Join-Path $env:CORTEX_LOCAL_DIR $POCKET_MODEL_ASSET
     if (Test-Path -LiteralPath $local -PathType Leaf) {
       Copy-Item -LiteralPath $local -Destination $dest -Force
+      Assert-InstallerArtifact -Path $dest -ExpectedHash $POCKET_MODEL_ARCHIVE_SHA256
       return
     }
   }
-  $url = "https://api.github.com/repos/$POCKET_MODEL_REPOSITORY/releases/assets/$POCKET_MODEL_RELEASE_ASSET_ID"
+  # Use the immutable public release URL and verify before inspecting/extracting.
+  $url = "https://github.com/$POCKET_MODEL_REPOSITORY/releases/download/$POCKET_MODEL_RELEASE_TAG/$POCKET_MODEL_ASSET"
   try {
-    Invoke-WebRequest -Uri $url -Headers @{ Accept = 'application/octet-stream'; 'User-Agent' = 'cortex-installer' } -OutFile $dest
+    Invoke-WebRequest -Uri $url -OutFile $dest
+    Assert-InstallerArtifact -Path $dest -ExpectedHash $POCKET_MODEL_ARCHIVE_SHA256
   } catch {
     Die "could not download the verified Pocket model release ($POCKET_MODEL_REPOSITORY@$POCKET_MODEL_RELEASE_TAG)"
   }
@@ -454,10 +510,10 @@ function Invoke-OfficialPowerShellInstaller {
       # Give that vendor-owned migration an ordinary visible console instead.
       Warn 'Older Codex layout needs one confirmation; opening PowerShell for the vendor migration...'
       $quotedTmp = '"' + $tmp.Replace('"', '""') + '"'
-      $child = Start-Process -FilePath $psHostPath -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File $quotedTmp" -Wait -PassThru
+      $child = Start-Process -FilePath $psHostPath -ArgumentList "-NoProfile -File $quotedTmp" -Wait -PassThru
       $exitCode = $child.ExitCode
     } else {
-      & $psHostPath -NoProfile -ExecutionPolicy Bypass -File $tmp
+      & $psHostPath -NoProfile -File $tmp
       $exitCode = $LASTEXITCODE
     }
     if ($exitCode -ne 0) {
@@ -577,12 +633,68 @@ function Stop-RunningApp {
   Ok 'stopped running app'
 }
 
+function Test-PocketArchiveEntries {
+  param([string[]]$Entries)
+  # The pinned upstream archive was created on macOS and also contains these
+  # two AppleDouble metadata files. Extract only the real model/tokenizer.
+  $required = @('model.safetensors', 'tokenizer.model')
+  $allowed = @($required) + @('._model.safetensors', '._tokenizer.model')
+  foreach ($entry in $Entries) { if ($entry -notin $allowed) { return $false } }
+  foreach ($name in $allowed) {
+    $count = @($Entries | Where-Object { $_ -eq $name }).Count
+    if ($count -gt 1 -or ($name -in $required -and $count -ne 1)) { return $false }
+  }
+  return $true
+}
+
+function Install-VerifiedBun {
+  # Use Bun's published native ZIP instead of evaluating its web installer.
+  # Keep the runtime aligned with the build/release toolchain version.
+  $bunTag = 'bun-v1.3.14'
+  $bunAssetName = if ($ARCH -eq 'arm64') { 'bun-windows-aarch64.zip' } else { 'bun-windows-x64-baseline.zip' }
+  $release = Invoke-RestMethod -Uri "https://api.github.com/repos/oven-sh/bun/releases/tags/$bunTag" -Headers @{ 'User-Agent' = 'cortex-windows-installer' }
+  $asset = @($release.assets | Where-Object { $_.name -eq $bunAssetName -and $_.state -eq 'uploaded' })
+  if ($asset.Count -ne 1 -or [string]$asset[0].digest -notmatch '^sha256:[0-9a-fA-F]{64}$') { throw 'Bun release has no verified Windows archive.' }
+  $archive = Join-Path $WORK $bunAssetName
+  Invoke-WebRequest -Uri "https://github.com/oven-sh/bun/releases/download/$bunTag/$bunAssetName" -OutFile $archive
+  Assert-InstallerArtifact -Path $archive -ExpectedHash ([string]$asset[0].digest).Substring(7) -ExpectedSize $asset[0].size
+  $stage = Join-Path $WORK 'bun'
+  Expand-Archive -LiteralPath $archive -DestinationPath $stage
+  $executable = @(Get-ChildItem -LiteralPath $stage -Filter bun.exe -Recurse -File)
+  if ($executable.Count -ne 1) { throw 'Bun archive has unexpected executable contents.' }
+  $bin = Join-Path $env:USERPROFILE '.bun\bin'
+  New-Item -ItemType Directory -Force -Path $bin | Out-Null
+  $target = Join-Path $bin 'bun.exe'
+  Copy-Item -LiteralPath $executable[0].FullName -Destination $target -Force
+  $version = & $target --version
+  if ($LASTEXITCODE -ne 0 -or [string]$version -ne '1.3.14') { throw 'Verified Bun runtime did not pass its version check.' }
+  $env:Path = "$bin;$env:Path"
+  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if (@($userPath -split ';') -notcontains $bin) { [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User') }
+  Ok "installed verified Bun $version"
+}
+
+function Remove-InstallerDuplicateSetupHook {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+  $package = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+  # The installer runs its bundled setup itself. Keep dependency lifecycle
+  # hooks, but never run an older root setup hook from the support archive.
+  if ($package.scripts -and $package.scripts.PSObject.Properties['postinstall']) {
+    $package.scripts.PSObject.Properties.Remove('postinstall')
+    [IO.File]::WriteAllText($Path, ($package | ConvertTo-Json -Depth 100), [Text.UTF8Encoding]::new($false))
+  }
+}
+
 try {
   # -- Install the app -------------------------------------------------------
   Step "Installing $APP_NAME"
   $zipPath = Join-Path $WORK $APP_ZIP
   Dl $APP_ZIP $zipPath
   Ok "downloaded $APP_ZIP"
+  # Verify both required archives before stopping or replacing an existing app.
+  $tarPath = Join-Path $WORK $SUPPORT_TAR
+  Dl $SUPPORT_TAR $tarPath
   $unpack = Join-Path $WORK 'app'
   Expand-Archive -Path $zipPath -DestinationPath $unpack -Force
   # The zip may contain the app at its root or nested one level (electron-builder
@@ -590,8 +702,13 @@ try {
   $exe = Get-ChildItem -Path $unpack -Recurse -Filter "$APP_NAME.exe" -File | Select-Object -First 1
   if (-not $exe) { Die "no $APP_NAME.exe found inside $APP_ZIP" }
   $srcDir = $exe.Directory.FullName
+  $resolvedInstallDir = [IO.Path]::GetFullPath($INSTALL_DIR)
+  $allowedInstallRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs')).TrimEnd('\') + '\'
+  if (-not $resolvedInstallDir.StartsWith($allowedInstallRoot, [StringComparison]::OrdinalIgnoreCase) -or
+      [IO.Path]::GetFileName($resolvedInstallDir) -ne $APP_NAME) { Die 'Unsafe application install target.' }
+  if ((Test-Path -LiteralPath $resolvedInstallDir) -and (Get-Item -LiteralPath $resolvedInstallDir -Force).LinkType) { Die 'The application install directory must not be a symlink or junction.' }
   Stop-RunningApp
-  if (Test-Path $INSTALL_DIR) { Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue }
+  if (Test-Path -LiteralPath $resolvedInstallDir) { Remove-Item -LiteralPath $resolvedInstallDir -Recurse -Force -ErrorAction SilentlyContinue }
   New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
   Copy-Item -Path (Join-Path $srcDir '*') -Destination $INSTALL_DIR -Recurse -Force
   Ok "installed -> $INSTALL_DIR"
@@ -635,8 +752,6 @@ try {
   # -- Provision data dir ----------------------------------------------------
   Step "Provisioning $DATA_DIR"
   New-Item -ItemType Directory -Force -Path $DATA_DIR | Out-Null
-  $tarPath = Join-Path $WORK $SUPPORT_TAR
-  Dl $SUPPORT_TAR $tarPath
   # Windows 10 1803+ ships bsdtar as tar.exe, which reads .tar.gz directly.
   if (Get-Command tar.exe -ErrorAction SilentlyContinue) {
     & tar.exe -xzf $tarPath -C $DATA_DIR
@@ -645,6 +760,12 @@ try {
     Die 'tar.exe not found - Windows 10 1803+ is required.'
   }
   Ok 'extracted bot + support files'
+  if ($env:CORTEX_INSTALL_SETUP) {
+    # The launcher carries the reviewed setup source; do not run a historical
+    # setup script from an older support bundle when using this installer.
+    Copy-Item -LiteralPath $env:CORTEX_INSTALL_SETUP -Destination (Join-Path $DATA_DIR 'setup.ps1') -Force
+    Remove-InstallerDuplicateSetupHook -Path (Join-Path $DATA_DIR 'package.json')
+  }
 
   # -- Pocket release model -------------------------------------------------
   # The model stays a distinct, versioned GitHub Release asset. It is not part
@@ -672,22 +793,10 @@ try {
     $pocketStage = Join-Path $pocketModelDir ('.release-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $pocketStage | Out-Null
     $pocketContents = @(& tar.exe -tzf $pocketArchive)
-    if ($LASTEXITCODE -ne 0) { Die "could not inspect $POCKET_MODEL_ASSET" }
-    # The archive is rolled on macOS, where BSD tar stores extended attributes
-    # as AppleDouble "._<name>" sibling entries. macOS tar merges those back
-    # when reading, so install.sh only ever sees the two payload members, but
-    # Windows tar.exe lists them verbatim. Allow exactly those siblings and
-    # nothing else, and require both payload members; the pinned SHA-256 checks
-    # below remain the trust boundary.
-    $pocketExpected = @('model.safetensors', 'tokenizer.model')
-    $pocketAllowed = $pocketExpected + ($pocketExpected | ForEach-Object { "._$_" })
-    $pocketUnexpected = @($pocketContents | Where-Object { $pocketAllowed -notcontains $_ })
-    $pocketPayload = @($pocketContents | Where-Object { $pocketExpected -contains $_ } | Sort-Object -Unique)
-    if ($pocketUnexpected.Count -ne 0 -or $pocketPayload.Count -ne $pocketExpected.Count) {
+    if ($LASTEXITCODE -ne 0 -or -not (Test-PocketArchiveEntries $pocketContents)) {
       Die "$POCKET_MODEL_ASSET has unexpected contents"
     }
-    # Name the members explicitly so the AppleDouble stubs are never written.
-    & tar.exe -xzf $pocketArchive -C $pocketStage $pocketExpected
+    & tar.exe -xzf $pocketArchive -C $pocketStage 'model.safetensors' 'tokenizer.model'
     if ($LASTEXITCODE -ne 0 -or -not (Test-PocketReleaseModel -Directory $pocketStage)) {
       Die "$POCKET_MODEL_ASSET failed checksum verification"
     }
@@ -711,8 +820,8 @@ try {
     Ok "bun: $((Get-Command bun).Source)"
   } else {
     Warn 'bun not found - installing...'
-    try { Invoke-RestMethod 'https://bun.sh/install.ps1' | Invoke-Expression }
-    catch { Warn "bun web installer failed: $($_.Exception.Message)" }
+    try { Install-VerifiedBun }
+    catch { Warn "verified Bun install failed: $($_.Exception.Message)" }
     Sync-Path
     # Fall back to winget if the web installer didn't land bun on PATH.
     if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -755,7 +864,7 @@ try {
     )
     [Environment]::SetEnvironmentVariable('CORTEX_DATA_DIR', $DATA_DIR, 'Process')
     try {
-      & powershell -NoProfile -ExecutionPolicy Bypass -File $setup
+      & powershell -NoProfile -File $setup
       if ($LASTEXITCODE -ne 0) { Warn 'setup.ps1 reported problems (see above)' }
     } finally {
       [Environment]::SetEnvironmentVariable('CORTEX_DATA_DIR', $previousAppDataDir, 'Process')

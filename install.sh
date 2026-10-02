@@ -598,19 +598,29 @@ ensure_node() {
 
 echo "W3I — installer"
 
+detect_installer_arch() {
+  if [ -n "${CORTEX_ARCH:-}" ]; then
+    [ -n "${CORTEX_LOCAL_DIR:-}" ] || die "CORTEX_ARCH is test-only and requires CORTEX_LOCAL_DIR."
+    case "$CORTEX_ARCH" in arm64|x64) ARCH="$CORTEX_ARCH" ;; *) die "CORTEX_ARCH must be arm64 or x64." ;; esac
+    warn "CORTEX_ARCH override: $ARCH (test only)"
+  elif [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+    ARCH="arm64"
+  elif [ "$(uname -m)" = "x86_64" ]; then
+    ARCH="x64"
+  else
+    die "Unsupported architecture: $(uname -m)"
+  fi
+}
+
 # ── Preflight ───────────────────────────────────────────
 step "Preflight"
 [ "$(uname -s)" = "Darwin" ] || die "This installer is macOS-only (found $(uname -s))."
 # Use the hardware capability bit, not `uname -m`: under Rosetta (e.g. a
 # Terminal with "Open using Rosetta" enabled) `uname -m` reports x86_64 even
 # on Apple Silicon, which would download the wrong-arch .app entirely.
-if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
-  ARCH="arm64"
-elif [ "$(uname -m)" = "x86_64" ]; then
-  die "W3I currently supports Apple Silicon Macs only."
-else
-  die "Unsupported architecture: $(uname -m)"
-fi
+MACOS_VERSION="$(sw_vers -productVersion)"
+[ "${MACOS_VERSION%%.*}" -ge 12 ] || die "W3I requires macOS 12 or later (found $MACOS_VERSION)."
+detect_installer_arch
 if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" = "1" ]; then
   warn "running translated under Rosetta — installing native $ARCH build anyway"
 fi
@@ -732,7 +742,7 @@ dl() {
       || die "missing local artifact: $CORTEX_LOCAL_DIR/$name"
   elif [ -n "$TOKEN" ]; then
     id="$(asset_id "$name")"
-    [ -n "$id" ] || die "release ${TAG:-?} has no asset named $name"
+    [ -n "$id" ] || missing_release_asset "$name"
     # --speed-limit/--speed-time abort a genuinely stalled transfer (sustained
     # near-zero throughput) without penalizing a slow-but-active download, which
     # a hard --max-time would.
@@ -743,9 +753,18 @@ dl() {
       || die "download failed: $name (no response or the connection stalled after 3 attempts)"
   else
     url="https://github.com/${PUBLIC_REPO}/releases/download/${TAG}/${name}"
-    retry 3 curl -fL --progress-bar --connect-timeout 15 --speed-limit 1024 --speed-time 30 --continue-at - "$url" -o "$dest" \
-      || die "download failed: $name (no response or the connection stalled after 3 attempts)"
+    if ! retry 3 curl -fL --progress-bar --connect-timeout 15 --speed-limit 1024 --speed-time 30 --continue-at - "$url" -o "$dest"; then
+      [ "$(curl -sIL --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' "$url")" != 404 ] || missing_release_asset "$name"
+      die "download failed: $name (no response or the connection stalled after 3 attempts)"
+    fi
   fi
+}
+
+missing_release_asset() {
+  if [ "$1" = "W3I-x64.zip" ]; then
+    die "Release ${TAG:-?} does not include the Intel Mac build (W3I-x64.zip). Choose a release with Intel support using CORTEX_VERSION; your existing app is preserved."
+  fi
+  die "release ${TAG:-?} has no asset named $1"
 }
 
 # Download both independent update artifacts while the old app stays usable.
@@ -892,7 +911,7 @@ pocket_release_model_ready() {
     && pocket_file_matches "$POCKET_MODEL_ROOT/tokenizer.model" "$POCKET_TOKENIZER_SHA256"
 }
 
-if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ]; then
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ] && [ "$ARCH" = arm64 ]; then
 step "Pocket voice model"
 if pocket_release_model_ready; then
   ok "verified Pocket model already installed"
