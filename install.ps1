@@ -1,8 +1,8 @@
 # W3I - Windows installer (public distribution, no token needed).
 #
 # Windows counterpart of install.sh. By default it downloads the prebuilt
-# Windows build anonymously from the PUBLIC distribution repo's latest GitHub
-# Release - no GitHub token required:
+# Windows build anonymously from the PUBLIC distribution repo's newest stable
+# release with complete Windows assets - no GitHub token required:
 #
 #   irm https://raw.githubusercontent.com/thisiscortex/w3i-dist/main/install.ps1 | iex
 #
@@ -78,18 +78,23 @@ $POCKET_TOKENIZER_SHA256 = 'd461765ae179566678c93091c5fa6f2984c31bbe990bf1aa62d9
 $WORK = Join-Path ([System.IO.Path]::GetTempPath()) ("cortex-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 
-# Helper: GET with auth/redirect control via .NET HttpClient (stable across PS
-# 5.1 and 7; Invoke-WebRequest's redirect handling differs between them).
-function Get-Redirect-Location ($url) {
-  Add-Type -AssemblyName System.Net.Http
-  $handler = [System.Net.Http.HttpClientHandler]::new()
-  $handler.AllowAutoRedirect = $false
-  $client = [System.Net.Http.HttpClient]::new($handler)
-  try {
-    $resp = $client.GetAsync($url).GetAwaiter().GetResult()
-    if ($resp.Headers.Location) { return $resp.Headers.Location.ToString() }
-    return $null
-  } finally { $client.Dispose(); $handler.Dispose() }
+# GitHub's overall latest release may contain only macOS artifacts. Keep the
+# app and support bundle together; skip drafts, prereleases and partial uploads.
+function Get-WindowsRelease ($repository, $headers) {
+  $required = @($APP_ZIP, $SUPPORT_TAR, 'install.ps1')
+  for ($page = 1; ; $page++) {
+    # Invoke-RestMethod emits the JSON array as one pipeline object. Assign it
+    # before wrapping it, otherwise foreach sees the entire page as one release.
+    $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases?per_page=100&page=$page" -Headers $headers -TimeoutSec 15
+    $releases = @($releases)
+    foreach ($release in $releases) {
+      if ($release.draft -ne $false -or $release.prerelease -ne $false -or [string]::IsNullOrWhiteSpace($release.tag_name)) { continue }
+      $names = @($release.assets | Where-Object { $_.state -eq 'uploaded' } | ForEach-Object { $_.name })
+      $missing = @($required | Where-Object { $names -cnotcontains $_ })
+      if ($missing.Count -eq 0) { return $release }
+    }
+    if ($releases.Count -lt 100) { return $null }
+  }
 }
 
 # -- Locate the release (skipped in local mode) ------------------------------
@@ -101,25 +106,29 @@ if (-not $env:CORTEX_LOCAL_DIR) {
   if ($TOKEN) {
     # Authenticated: hit the PRIVATE source repo's API and parse the JSON.
     $SOURCE_REPO = $REPO
-    $ref = if ($env:CORTEX_VERSION) { "tags/$env:CORTEX_VERSION" } else { 'latest' }
     $headers = @{ Authorization = "Bearer $TOKEN"; Accept = 'application/vnd.github+json'; 'User-Agent' = 'cortex-installer' }
     try {
-      $REL_JSON = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/$ref" -Headers $headers
+      if ($env:CORTEX_VERSION) {
+        $ref = [Uri]::EscapeDataString($env:CORTEX_VERSION)
+        $REL_JSON = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/tags/$ref" -Headers $headers -TimeoutSec 15
+      } else {
+        $REL_JSON = Get-WindowsRelease $REPO $headers
+      }
     } catch {
       Die "Could not fetch the release from $REPO (bad token, no read access, or no release published yet)."
     }
+    if (-not $REL_JSON) { Die "No stable release with complete Windows assets is available in $REPO." }
     $TAG = $REL_JSON.tag_name
   }
   elseif ($env:CORTEX_VERSION) {
     $TAG = $env:CORTEX_VERSION
   }
   else {
-    # Anonymous: follow the /releases/latest redirect to learn the tag, then
-    # download from deterministic public URLs (avoids the anon API rate limit).
-    $loc = Get-Redirect-Location "https://github.com/$PUBLIC_REPO/releases/latest"
-    if (-not $loc) { Die "Could not resolve the latest release from $PUBLIC_REPO." }
-    $TAG = $loc.Split('/')[-1]
-    if (-not $TAG -or $TAG -eq 'latest') { Die "Could not resolve the latest release tag from $PUBLIC_REPO." }
+    $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'cortex-installer' }
+    try { $REL_JSON = Get-WindowsRelease $PUBLIC_REPO $headers }
+    catch { Die "Could not list Windows releases from $PUBLIC_REPO (network or GitHub API rate limit). $($_.Exception.Message)" }
+    if (-not $REL_JSON) { Die "No stable release with complete Windows assets is available in $PUBLIC_REPO." }
+    $TAG = $REL_JSON.tag_name
   }
   Ok "release $(if ($TAG) { $TAG } else { '?' }) ($SOURCE_REPO)"
 }
@@ -140,7 +149,8 @@ function Dl ($name, $dest) {
     catch { Die "download failed: $name" }
   }
   else {
-    $url = "https://github.com/$PUBLIC_REPO/releases/download/$TAG/$name"
+    $encodedTag = [Uri]::EscapeDataString($TAG)
+    $url = "https://github.com/$PUBLIC_REPO/releases/download/$encodedTag/$name"
     try { Invoke-WebRequest -Uri $url -OutFile $dest }
     catch { Die "download failed: $name" }
   }
