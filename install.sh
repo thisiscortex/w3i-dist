@@ -172,6 +172,188 @@ installed_build_tag() {
   awk -F'"' '/"tag":[[:space:]]*"/ { print $4; exit }' "$vf"
 }
 
+# ── Claude sign-in diagnostics ──────────────────────────
+# Users report having to sign in to Claude again after an app update. These
+# probes record the shape of Claude's stored credential (never its value) at
+# each update phase, and a detached monitor records every change until a while
+# after the relaunch, so the log names the phase and the processes running when
+# the credential changed. Tokens are reduced to length plus an 8-hex SHA-256
+# fingerprint; the credential JSON travels only through pipes and shell
+# variables, never argv. Every probe is best-effort and must never fail or
+# noticeably slow the update. CORTEX_CLAUDE_AUTH_DIAG=0 disables them.
+claude_auth_diag_log() {
+  printf '%s' "${DATA_DIR:-$HOME/.cortex-ai-sessions}/claude-auth-diagnostics.log"
+}
+
+# Mirrors the CLI: CLAUDE_SECURESTORAGE_CONFIG_DIR (even empty) wins over
+# CLAUDE_CONFIG_DIR, and a non-empty scope suffixes the Keychain service.
+claude_auth_keychain_service() {
+  local scope="${CLAUDE_SECURESTORAGE_CONFIG_DIR-${CLAUDE_CONFIG_DIR:-}}"
+  if [ -n "$scope" ]; then
+    printf 'Claude Code-credentials-%s' "$(printf '%s' "$scope" | shasum -a 256 | cut -c1-8)"
+  else
+    printf 'Claude Code-credentials'
+  fi
+}
+
+# claude_auth_json_field <json> <key.path> — raw value, empty when absent.
+claude_auth_json_field() {
+  printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null | tr -d '\n'
+}
+
+# claude_auth_token_shape <json> <key.path> — "len/fingerprint", or "absent".
+claude_auth_token_shape() {
+  local value
+  value="$(claude_auth_json_field "$1" "$2")"
+  if [ -z "$value" ]; then printf 'absent'; return 0; fi
+  printf '%s/%s' "${#value}" "$(printf '%s' "$value" | shasum -a 256 | cut -c1-8)"
+}
+
+claude_auth_ms_to_date() {
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "${1:-absent}" ;;
+    0) printf '0 (cleared)' ;;
+    *) printf '%s (%s min from now)' "$(date -r "$(($1 / 1000))" '+%Y-%m-%d %H:%M:%S %z')" "$((($1 / 1000 - $(date +%s)) / 60))" ;;
+  esac
+}
+
+# claude_auth_credential_summary <json> — one secret-free line.
+claude_auth_credential_summary() {
+  local json="$1"
+  [ -n "$json" ] || { printf 'no credential JSON'; return 0; }
+  printf 'access=%s refresh=%s expiresAt=%s refreshExpiresAt=%s subscription=%s scopes=%s' \
+    "$(claude_auth_token_shape "$json" claudeAiOauth.accessToken)" \
+    "$(claude_auth_token_shape "$json" claudeAiOauth.refreshToken)" \
+    "$(claude_auth_ms_to_date "$(claude_auth_json_field "$json" claudeAiOauth.expiresAt)")" \
+    "$(claude_auth_ms_to_date "$(claude_auth_json_field "$json" claudeAiOauth.refreshTokenExpiresAt)")" \
+    "$(claude_auth_json_field "$json" claudeAiOauth.subscriptionType)" \
+    "$(printf '%s' "$json" | plutil -extract claudeAiOauth.scopes json -o - - 2>/dev/null | tr -d '\n')"
+}
+
+# claude_auth_with_timeout <seconds> <command...> — stdout only; kills a hang.
+claude_auth_with_timeout() {
+  local seconds="$1" pid watcher rc
+  shift
+  "$@" 2>/dev/null &
+  pid=$!
+  ( sleep "$seconds"; kill -9 "$pid" ) >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid"; rc=$?
+  kill "$watcher" >/dev/null 2>&1
+  wait "$watcher" 2>/dev/null
+  return "$rc"
+}
+
+# Cheap state used by the monitor to detect a change between snapshots.
+claude_auth_fingerprint() {
+  local svc json rc
+  svc="$(claude_auth_keychain_service)"
+  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"; rc=$?
+  printf 'keychain-rc=%s %s | %s | file=%s' "$rc" \
+    "$(security find-generic-password -s "$svc" 2>/dev/null | grep -E '"mdat"' | sed -E 's/.*"([0-9]{14}Z).*/mdat=\1/')" \
+    "$(claude_auth_credential_summary "$json" | sed -E 's/ \([-0-9]+ min from now\)//g')" \
+    "$(stat -f '%m' "$HOME/.claude/.credentials.json" 2>/dev/null || echo absent)"
+}
+
+claude_auth_snapshot_body() {
+  local phase="$1" svc meta json rc bin status_json file_json desktop
+  svc="$(claude_auth_keychain_service)"
+  printf '\n=== [%s] %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$phase"
+  printf 'installer: pid=%s app=%s release=%s installed=%s in-app-update=%s\n' \
+    "$$" "${APP_NAME:-?}" "${TAG:-?}" "$(installed_build_tag 2>/dev/null)" "${IN_APP_UPDATE:-0}"
+  printf 'env: CLAUDE_CONFIG_DIR=%s CLAUDE_SECURESTORAGE_CONFIG_DIR=%s ANTHROPIC_API_KEY=%s CLAUDE_CODE_OAUTH_TOKEN=%s ANTHROPIC_AUTH_TOKEN=%s\n' \
+    "${CLAUDE_CONFIG_DIR:-unset}" "${CLAUDE_SECURESTORAGE_CONFIG_DIR-unset}" \
+    "${ANTHROPIC_API_KEY:+set}" "${CLAUDE_CODE_OAUTH_TOKEN:+set}" "${ANTHROPIC_AUTH_TOKEN:+set}"
+
+  meta="$(security find-generic-password -s "$svc" 2>&1)"; rc=$?
+  printf 'keychain "%s": rc=%s %s\n' "$svc" "$rc" \
+    "$(printf '%s\n' "$meta" | grep -E '"(cdat|mdat)"' | sed -E 's/.*"(cdat|mdat)".*"([0-9]{14}Z).*/\1=\2/' | tr '\n' ' ')"
+  [ "$rc" -eq 0 ] || printf 'keychain error: %s\n' "$(printf '%s' "$meta" | tail -n 1)"
+  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"
+  printf 'keychain credential: %s\n' "$(claude_auth_credential_summary "$json")"
+
+  if [ -f "$HOME/.claude/.credentials.json" ]; then
+    file_json="$(cat "$HOME/.claude/.credentials.json" 2>/dev/null)"
+    printf 'credentials file: mtime=%s %s\n' "$(stat -f '%Sm' "$HOME/.claude/.credentials.json" 2>/dev/null)" \
+      "$(claude_auth_credential_summary "$file_json")"
+  else
+    printf 'credentials file: absent\n'
+  fi
+  if [ -f "$HOME/.claude.json" ]; then
+    printf '~/.claude.json: size=%s mtime=%s oauthAccount=%s\n' \
+      "$(stat -f '%z' "$HOME/.claude.json" 2>/dev/null)" "$(stat -f '%Sm' "$HOME/.claude.json" 2>/dev/null)" \
+      "$([ -n "$(plutil -extract oauthAccount.accountUuid raw -o - "$HOME/.claude.json" 2>/dev/null)" ] && echo present || echo absent)"
+  else
+    printf '~/.claude.json: absent\n'
+  fi
+  printf 'lock files: %s\n' "$( { find "$HOME/.claude" -maxdepth 1 -iname '*lock*' 2>/dev/null; ls -d "$HOME/.claude.json.lock" 2>/dev/null; } | tr '\n' ' ')"
+
+  bin="$(command -v claude 2>/dev/null)"
+  if [ -n "$bin" ]; then
+    printf 'claude: %s -> %s, %s\n' "$bin" "$(readlink "$bin" 2>/dev/null || echo '-')" \
+      "$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" --version | head -n 1)"
+    # `auth status` reads stored credentials only; it never refreshes them.
+    status_json="$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" auth status --json)"
+    printf 'claude auth status: loggedIn=%s authMethod=%s apiProvider=%s subscription=%s\n' \
+      "$(claude_auth_json_field "$status_json" loggedIn)" "$(claude_auth_json_field "$status_json" authMethod)" \
+      "$(claude_auth_json_field "$status_json" apiProvider)" "$(claude_auth_json_field "$status_json" subscriptionType)"
+  else
+    printf 'claude: not on PATH\n'
+  fi
+  printf 'installed CLI versions: %s\n' "$(ls "$HOME/.local/share/claude/versions" 2>/dev/null | tr '\n' ' ')"
+  desktop="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Claude.app/Contents/Info.plist 2>/dev/null)"
+  printf 'Claude Desktop: %s; bundled Claude Code: %s\n' "${desktop:-absent}" \
+    "$(ls "$HOME/Library/Application Support/Claude/claude-code" 2>/dev/null | tr '\n' ' ')"
+  # Executable paths only: full argv can carry prompt text.
+  printf 'processes (pid ppid elapsed executable):\n'
+  ps -axo pid=,ppid=,etime=,comm= 2>/dev/null \
+    | grep -iE 'claude|codex|cortex|w3i' \
+    | grep -vE 'grep|Helper|crashpad|ShipIt|disclaimer|chrome-native-host|ChatGPT for Chrome' \
+    | head -n 60 | sed 's/^/  /'
+}
+
+# claude_auth_snapshot <phase> — append one snapshot; never fails the caller.
+claude_auth_snapshot() {
+  [ "${CORTEX_CLAUDE_AUTH_DIAG:-1}" = "0" ] && return 0
+  local log body
+  log="$(claude_auth_diag_log)"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+  body="$( set +e +u +o pipefail; claude_auth_snapshot_body "$1" 2>&1 )" || true
+  # One append per snapshot so the monitor's entries never interleave with it.
+  printf '%s\n' "$body" >> "$log" 2>/dev/null || true
+  return 0
+}
+
+# Detached: snapshots every credential change for CORTEX_CLAUDE_AUTH_DIAG_SECONDS
+# (default 25 minutes), outliving the installer and the relaunch.
+start_claude_auth_monitor() {
+  [ "${CORTEX_CLAUDE_AUTH_DIAG:-1}" = "0" ] && return 0
+  local log seconds="${CORTEX_CLAUDE_AUTH_DIAG_SECONDS:-1500}"
+  log="$(claude_auth_diag_log)"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || return 0
+  if [ "$(stat -f '%z' "$log" 2>/dev/null || echo 0)" -gt 2097152 ]; then
+    mv -f "$log" "$log.1" 2>/dev/null || true
+  fi
+  (
+    trap - EXIT
+    set +e +u +o pipefail
+    end=$((SECONDS + seconds))
+    last="$(claude_auth_fingerprint)"
+    printf '\n=== [%s] monitor started (pid %s, %ss): %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(exec sh -c 'echo "$PPID"')" "$seconds" "$last" >> "$log"
+    while [ "$SECONDS" -lt "$end" ]; do
+      sleep 5
+      now="$(claude_auth_fingerprint)"
+      if [ "$now" != "$last" ]; then
+        claude_auth_snapshot "monitor: credential changed (was: $last)"
+        last="$now"
+      fi
+    done
+    claude_auth_snapshot "monitor finished"
+  ) </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
 # Resolve the login-shell PATH so Bun/conda/pyenv are found even when this runs
 # piped from curl (a non-interactive, minimal-PATH shell). Mirrors setup.command.
 # -ilc sources rc files so PATH matches a real terminal, but those (and macOS
@@ -516,22 +698,105 @@ ensure_local_bin_link() {
     || warn "could not link $name into $LOCAL_BIN — sign-in may fail with ENOENT"
 }
 
-# Ensure Node.js + npm are available.
+# ── Runtime health (Bun + Node) ─────────────────────────
+# `command -v` only proves that a file exists. A Bun or Node left behind by
+# another installer can still be broken: built for the other CPU, an AVX2 Bun
+# on an older Intel Mac, a truncated download, or too old to read the support
+# bundle's text bun.lock. Run each candidate before trusting it.
+BUN_MIN_MAJOR=1
+BUN_MIN_MINOR=2
+NODE_MIN_MAJOR=20
+# Bun pinned to the release toolchain. The SHA-256 values are fixed here rather
+# than fetched beside the archive. x64 uses Bun's baseline build because the
+# default build needs AVX2, which older Intel Macs lack.
+BUN_PINNED_TAG="bun-v1.3.14"
+BUN_DARWIN_ARM64_SHA256="d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620"
+BUN_DARWIN_X64_BASELINE_SHA256="3e35ad6f53971a9834bf9e6786e2adf72b5f1921cc9a9c5fde073d2972944076"
+BUN_BIN=""
+NODE_BIN=""
+
+# Succeeds only when $1 is an executable Bun >= 1.2 that can run JavaScript.
+bun_works() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" -e "const [a,b]=Bun.version.split('.').map(Number);process.exit(a>$BUN_MIN_MAJOR||(a===$BUN_MIN_MAJOR&&b>=$BUN_MIN_MINOR)?0:1)" >/dev/null 2>&1
+}
+
+# Succeeds only when $1 is an executable Node >= 20 whose sibling npm runs.
+# Homebrew, nodejs.org, nvm and fnm all install npm beside node.
+node_works() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" -e "process.exit(Number(process.versions.node.split('.')[0])>=$NODE_MIN_MAJOR?0:1)" >/dev/null 2>&1 || return 1
+  # npm is a `#!/usr/bin/env node` script, so probe it with this node first on PATH.
+  [ -x "$(dirname "$1")/npm" ] && PATH="$(dirname "$1"):$PATH" "$(dirname "$1")/npm" --version >/dev/null 2>&1
+}
+
+# The first working candidate wins: the login-shell PATH entry first, then the
+# copies a Cortex install manages. Prints its path.
+find_working_bun() {
+  local candidate
+  for candidate in "$(command -v bun 2>/dev/null || true)" "$HOME/.bun/bin/bun"; do
+    bun_works "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+find_working_node() {
+  local candidate
+  for candidate in "$(command -v node 2>/dev/null || true)" "$LOCAL_BIN/node" /opt/homebrew/bin/node /usr/local/bin/node; do
+    node_works "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+# Install the pinned Bun into ~/.bun/bin, replacing a broken copy there.
+install_verified_bun() {
+  local asset sum tmp rc
+  case "$ARCH" in
+    arm64) asset="bun-darwin-aarch64.zip"; sum="$BUN_DARWIN_ARM64_SHA256" ;;
+    x64)   asset="bun-darwin-x64-baseline.zip"; sum="$BUN_DARWIN_X64_BASELINE_SHA256" ;;
+    *) return 1 ;;
+  esac
+  tmp="$(mktemp -d)" || return 1
+  if ! retry 3 curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 30 \
+       "https://github.com/oven-sh/bun/releases/download/${BUN_PINNED_TAG}/${asset}" -o "$tmp/$asset"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if [ "$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')" != "$sum" ]; then
+    warn "Bun download failed SHA-256 verification"
+    rm -rf "$tmp"; return 1
+  fi
+  rc=1
+  if ditto -x -k "$tmp/$asset" "$tmp/x" && bun_works "$tmp/x/${asset%.zip}/bun" \
+     && mkdir -p "$HOME/.bun/bin" \
+     && install -m 755 "$tmp/x/${asset%.zip}/bun" "$HOME/.bun/bin/bun.cortex-new" \
+     && mv -f "$HOME/.bun/bin/bun.cortex-new" "$HOME/.bun/bin/bun"; then
+    ln -sf bun "$HOME/.bun/bin/bunx" 2>/dev/null || true
+    rc=0
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# Ensure a working Node.js + npm (sets NODE_BIN and puts it first on PATH).
 #
 # The Claude/Codex CLIs the bot drives are installed via `npm install -g`, and
-# the app's MCP servers run on `node`. A machine with no Node has no npm, so
-# those steps were silently skipped ("npm unavailable") and sign-in then failed.
-# Install Node without assuming any package manager: prefer Homebrew when it's
-# present, otherwise drop the official Node LTS build into ~/.local (its bin dir
-# is already on PATH and is the app's CLI fallback root). Depends on $ARCH, so
-# call this only after Preflight has set it.
+# the app's MCP servers run on `node` (registered by absolute path below). A
+# missing or broken Node used to skip those steps silently ("npm unavailable"),
+# and sign-in then failed. Homebrew is used only when no Node exists at all, so
+# a user's own broken install is never modified. Otherwise the official Node
+# LTS build, verified against nodejs.org's SHASUMS256.txt, goes into ~/.local.
+# Depends on $ARCH, so call this only after Preflight has set it.
 ensure_node() {
   hash -r 2>/dev/null || true
-  if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
-    ok "node: $(command -v node) · npm: $(command -v npm)"
+  if NODE_BIN="$(find_working_node)"; then
+    export PATH="$(dirname "$NODE_BIN"):$PATH"
+    ok "node $("$NODE_BIN" --version): $NODE_BIN · npm: $(dirname "$NODE_BIN")/npm"
     return 0
   fi
-  if command -v brew >/dev/null 2>&1; then
+  NODE_BIN=""
+  if command -v node >/dev/null 2>&1; then
+    warn "node at $(command -v node) does not run, lacks a working npm, or is older than v${NODE_MIN_MAJOR}"
+  elif command -v brew >/dev/null 2>&1; then
     warn "node/npm not found — installing via Homebrew…"
     # `</dev/null`: the installer is run as `curl … | bash`, so the script IS
     # stdin. A real `brew install` reads stdin during its fetch/first-run path
@@ -539,20 +804,25 @@ ensure_node() {
     # after this step. Detach stdin so brew can't eat the remaining commands.
     if brew install node </dev/null >/dev/null 2>&1; then
       hash -r 2>/dev/null || true
-      command -v npm >/dev/null 2>&1 && { ok "Node installed via Homebrew"; return 0; }
+      if NODE_BIN="$(find_working_node)"; then
+        export PATH="$(dirname "$NODE_BIN"):$PATH"
+        ok "Node installed via Homebrew → $NODE_BIN"
+        return 0
+      fi
     fi
+    NODE_BIN=""
     warn "Homebrew node install failed — falling back to the official Node build"
   fi
 
   # Official prebuilt Node from nodejs.org — no package manager required. The
   # dist filenames use x64/arm64, matching our $ARCH values.
-  local node_arch tmp url srcdir node_ver
+  local node_arch tmp url srcdir node_ver archive expected actual
   case "$ARCH" in
     arm64) node_arch="arm64" ;;
     x64)   node_arch="x64" ;;
     *) warn "cannot auto-install Node for arch $ARCH — install it from https://nodejs.org"; return 1 ;;
   esac
-  warn "node/npm not found — downloading the official Node LTS build…"
+  warn "downloading the official Node LTS build…"
   tmp="$(mktemp -d)"
   # index.json lists releases newest-first; the first entry whose "lts" is a
   # codename (not false) is the current LTS line. Derive its version and build
@@ -566,9 +836,17 @@ ensure_node() {
     warn "could not resolve the latest Node LTS version — install Node from https://nodejs.org"
     rm -rf "$tmp"; return 1
   fi
-  url="https://nodejs.org/dist/${node_ver}/node-${node_ver}-darwin-${node_arch}.tar.gz"
+  archive="node-${node_ver}-darwin-${node_arch}.tar.gz"
+  url="https://nodejs.org/dist/${node_ver}/${archive}"
   if ! curl -fL --connect-timeout 15 --speed-limit 1024 --speed-time 30 "$url" -o "$tmp/node.tar.gz"; then
     warn "Node download failed — install Node from https://nodejs.org"
+    rm -rf "$tmp"; return 1
+  fi
+  expected="$(curl -fsSL --connect-timeout 15 --max-time 30 "https://nodejs.org/dist/${node_ver}/SHASUMS256.txt" 2>/dev/null \
+    | awk -v f="$archive" '$2 == f { print $1; exit }' || true)"
+  actual="$(shasum -a 256 "$tmp/node.tar.gz" | awk '{print $1}')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    warn "Node download failed SHA-256 verification — install Node from https://nodejs.org"
     rm -rf "$tmp"; return 1
   fi
   if ! tar -xzf "$tmp/node.tar.gz" -C "$tmp"; then
@@ -586,13 +864,14 @@ ensure_node() {
   cp -R "$srcdir/include/." "$HOME/.local/include/" 2>/dev/null || true
   cp -R "$srcdir/share/." "$HOME/.local/share/" 2>/dev/null || true
   rm -rf "$tmp"
-  export PATH="$HOME/.local/bin:$PATH"
   hash -r 2>/dev/null || true
-  if command -v npm >/dev/null 2>&1; then
-    ok "Node installed → $(command -v node)"
+  if node_works "$HOME/.local/bin/node"; then
+    NODE_BIN="$HOME/.local/bin/node"
+    export PATH="$HOME/.local/bin:$PATH"
+    ok "Node installed → $NODE_BIN ($("$NODE_BIN" --version))"
     return 0
   fi
-  warn "Node install did not put npm on PATH — install Node from https://nodejs.org"
+  warn "the installed Node does not run — install Node from https://nodejs.org"
   return 1
 }
 
@@ -829,7 +1108,11 @@ ok "prepared app + support files"
 # ── Install the .app ────────────────────────────────────
 step "Installing ${APP_NAME}.app"
 [ "$IN_APP_UPDATE" = "1" ] && APP_RELAUNCH_REQUIRED=1
+start_claude_auth_monitor
+claude_auth_snapshot "before quitting the running app"
+ok "Claude sign-in diagnostics → $(claude_auth_diag_log)"
 quit_running_app
+claude_auth_snapshot "after quitting the running app"
 refresh_launchservices unregister
 # /Applications is writable by admins without sudo, but a locked bundle, a
 # managed (MDM) volume, or a non-admin account will block the swap. Check up
@@ -897,6 +1180,7 @@ if [ "$IN_APP_UPDATE" = "1" ]; then
     warn "could not prepare $CONFIG; deferring relaunch until setup repairs it"
   fi
 fi
+claude_auth_snapshot "after installing the app bundle and relaunch"
 
 # ── Pocket release model ───────────────────────────────
 # The model lives in an immutable, dedicated GitHub Release rather than inside
@@ -941,21 +1225,35 @@ else
 fi
 fi
 
-# ── Bun (required for Node deps + the bot) ──────────────
+# ── Bun (installs the support runtime's Node deps) ─────
 step "Bun"
-if command -v bun >/dev/null 2>&1; then
-  ok "bun: $(command -v bun)"
+if BUN_BIN="$(find_working_bun)"; then
+  ok "bun $("$BUN_BIN" --version 2>/dev/null): $BUN_BIN"
 else
-  warn "bun not found — installing…"
-  retry 3 bash -c 'curl -fsSL --connect-timeout 15 --max-time 60 https://bun.sh/install | bash' \
-    || die "bun install failed (could not download from bun.sh after 3 attempts — check your network, then re-run)"
-  export PATH="$HOME/.bun/bin:$PATH"
-  command -v bun >/dev/null 2>&1 && ok "bun installed" || die "bun still not on PATH — add \$HOME/.bun/bin to PATH, then re-run"
+  BUN_BIN=""
+  if command -v bun >/dev/null 2>&1; then
+    warn "bun at $(command -v bun) does not run or is older than ${BUN_MIN_MAJOR}.${BUN_MIN_MINOR} — installing a verified Bun…"
+  else
+    warn "bun not found — installing a verified Bun…"
+  fi
+  if ! install_verified_bun; then
+    warn "verified Bun download failed — trying the bun.sh installer…"
+    retry 3 bash -c 'curl -fsSL --connect-timeout 15 --max-time 60 https://bun.sh/install | bash' || true
+  fi
+  if bun_works "$HOME/.bun/bin/bun"; then
+    BUN_BIN="$HOME/.bun/bin/bun"
+    ok "bun installed: $BUN_BIN ($("$BUN_BIN" --version))"
+  else
+    warn "no working Bun — dependencies will be installed with npm instead"
+  fi
 fi
+[ -z "$BUN_BIN" ] || export PATH="$(dirname "$BUN_BIN"):$PATH"
 
 # ── Node.js + npm (runtime for MCP servers and npm-managed provider CLIs) ──
 step "Node.js"
 ensure_node || warn "continuing without Node — npm-managed provider CLIs and node-based MCP servers may be unavailable"
+[ -n "$BUN_BIN" ] || [ -n "$NODE_BIN" ] \
+  || die "neither a working Bun nor a working Node/npm is available — install Bun (https://bun.sh) or Node.js (https://nodejs.org), then re-run"
 
 # ── Delegate Node + Python deps + config to setup.command ─
 # setup.command (run from the data dir) installs Node deps via bun, installs the
@@ -971,6 +1269,8 @@ refresh_grok_cli_home
 ( cd "$DATA_DIR" && \
   CORTEX_RELEASE_INSTALL=1 \
   CORTEX_DATA_DIR="$DATA_DIR" \
+  CORTEX_SETUP_BUN_BIN="$BUN_BIN" \
+  CORTEX_SETUP_NODE_BIN="$NODE_BIN" \
   CORTEX_VOICE_TTS_BUNDLED_ASSET_DIR="$APP_PATH/Contents/Resources/standalone/scripts/voice-assets" \
   bash setup.command ) || die "setup.command failed; support runtime was not activated (see above)"
 restore_preserved_config_lines "$PRESERVED_CONFIG_BACKUP"
@@ -1333,11 +1633,13 @@ update_grok_cli() {
 # clears errexit inside it, so one vendor installer failing can never abort the
 # rest of the update (dependencies, voice runtime, relaunch failsafe).
 step "Provider CLI updates"
+claude_auth_snapshot "before provider CLI updates"
 run_guarded_cli_update claude update_claude_cli claude "Claude CLI"
 run_guarded_cli_update codex update_codex_cli codex "Codex CLI"
 run_guarded_cli_update antigravity update_agy_cli agy "Antigravity CLI"
 run_guarded_cli_update grok update_grok_cli grok "Grok CLI"
 release_cli_update_locks
+claude_auth_snapshot "after provider CLI updates"
 
 # ── Computer-control MCP server (mouse / keyboard / screen) ─
 # Cortex injects this MCP server per opted-in session. Do not register it at
@@ -1407,6 +1709,8 @@ else
   fi
 fi
 
+claude_auth_snapshot "after Claude MCP registration cleanup"
+
 # ── Google Chrome (WhatsApp bot via Puppeteer) ─
 # The WhatsApp bot needs Chrome for Puppeteer. Best-effort install via Homebrew
 # cask; warn if unavailable.
@@ -1427,6 +1731,7 @@ step "Other prerequisites (informational)"
   || warn "Claude Desktop not found — needed to read your claude.ai session."
 
 # ── Done ────────────────────────────────────────────────
+claude_auth_snapshot "install complete"
 echo
 ok "Install complete."
 echo
