@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-REPO="${CORTEX_SOURCE_REPO:-appfactory123/claude-sessions}"
+REPO="${CORTEX_SOURCE_REPO:-thisiscortex/claude-sessions}"
 PUBLIC_REPO="${CORTEX_PUBLIC_REPO:-thisiscortex/w3i-dist}"
 APP_NAME="W3I"
 APP_PATH="/Applications/${APP_NAME}.app"
@@ -94,8 +94,25 @@ app_executable_pattern() {
   printf '%s/Contents/MacOS/%s' "$APP_PATH" "$APP_NAME"
 }
 
+# Processes whose executable IS the app binary (`ps` comm), never ones whose
+# arguments merely mention it. Claude turns carry the app executable in their
+# hook/MCP command line, and `pgrep -f`/`pkill -f` used to treat them as the app
+# and SIGKILL them; a Claude CLI killed while refreshing its OAuth token loses
+# the rotated grant and the next CLI start signs the user out.
 app_pids() {
-  pgrep -f "$(app_executable_pattern)" 2>/dev/null || true
+  ps -axo pid=,comm= 2>/dev/null | awk -v exe="$(app_executable_pattern)" '{
+    pid = $1
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+    if ($0 == exe) print pid
+  }'
+}
+
+# signal_app_pids <SIGNAL> — signal exactly the processes app_pids reports.
+signal_app_pids() {
+  local pid
+  for pid in $(app_pids); do
+    kill "-$1" "$pid" >/dev/null 2>&1 || true
+  done
 }
 
 APP_RELAUNCH_REQUIRED=""
@@ -158,10 +175,10 @@ quit_running_app() {
   done
 
   warn "app did not quit in time — stopping the old installed executable"
-  pkill -TERM -f "$(app_executable_pattern)" >/dev/null 2>&1 || true
+  signal_app_pids TERM
   sleep 1
   if [ -n "$(app_pids)" ]; then
-    pkill -KILL -f "$(app_executable_pattern)" >/dev/null 2>&1 || true
+    signal_app_pids KILL
   fi
   [ -z "$(app_pids)" ] && ok "stopped running app" || warn "old app process may still be running"
 }
@@ -187,8 +204,11 @@ claude_auth_diag_log() {
 
 # Mirrors the CLI: CLAUDE_SECURESTORAGE_CONFIG_DIR (even empty) wins over
 # CLAUDE_CONFIG_DIR, and a non-empty scope suffixes the Keychain service.
+# claude_auth_keychain_service [scope] — with an argument, the item for that
+# secure-storage directory ("" = the shared default).
 claude_auth_keychain_service() {
   local scope="${CLAUDE_SECURESTORAGE_CONFIG_DIR-${CLAUDE_CONFIG_DIR:-}}"
+  [ "$#" -ge 1 ] && scope="$1"
   if [ -n "$scope" ]; then
     printf 'Claude Code-credentials-%s' "$(printf '%s' "$scope" | shasum -a 256 | cut -c1-8)"
   else
@@ -196,9 +216,58 @@ claude_auth_keychain_service() {
   fi
 }
 
+# The app's own Claude login store (electron/claude-login-store.js): the
+# packaged app sets it for its server, so an in-app update inherits it.
+claude_auth_app_store() {
+  printf '%s' "${CLAUDE_SECURESTORAGE_CONFIG_DIR-${DATA_DIR:-$HOME/.cortex-ai-sessions}/claude-login}"
+}
+
+# The login every other Claude tool shares (terminal CLI, Claude Desktop, IDEs).
+claude_auth_shared_service() {
+  claude_auth_keychain_service "${CLAUDE_CONFIG_DIR:-}"
+}
+
 # claude_auth_json_field <json> <key.path> — raw value, empty when absent.
 claude_auth_json_field() {
-  printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null | tr -d '\n'
+  local value
+  # plutil prints its "Could not extract value" error on stdout; drop it.
+  value="$(printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null)" || return 0
+  printf '%s' "$value" | tr -d '\n'
+}
+
+# The Claude CLI the app runs (lib/paths.ts findClaudeBin), not the installer's
+# login-shell PATH, which can resolve an older npm install first.
+claude_auth_app_claude_bin() {
+  local candidate
+  [ -n "${CLAUDE_BIN:-}" ] && [ -x "$CLAUDE_BIN" ] && { printf '%s' "$CLAUDE_BIN"; return 0; }
+  for candidate in "$HOME/.local/bin/claude" "$HOME/.bun/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    [ -x "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+  done
+  command -v claude 2>/dev/null || true
+}
+
+# Claude CLI processes with pgid, parent chain and flag names (values, prompts
+# and other arguments dropped), plus the Cortex/W3I app processes.
+claude_auth_processes() {
+  local comms
+  comms="$(ps -axo pid=,ppid=,pgid=,etime=,comm= 2>/dev/null)"
+  printf '%s\n' "$comms" | awk '
+    { pid=$1; ppid[pid]=$2; pgid[pid]=$3; age[pid]=$4; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", c); comm[pid]=c; order[++n]=pid }
+    function short(p,   s, k, parts) { s = comm[p]; if (s == "") return "?"; k = split(s, parts, "/"); return (k >= 3 ? parts[k-2] "/" parts[k-1] "/" : "") parts[k] }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = order[i]
+        if (comm[p] ~ /(^|\/)claude$/ || comm[p] ~ /\/claude\/versions\/[^\/]+$/ || comm[p] ~ /\/(Cortex|W3I)[^\/]*\.app\/Contents\/MacOS\/[^\/]+$/)
+          printf "%s %s %s %s %s|%s|%s\n", p, ppid[p], pgid[p], age[p], comm[p], short(ppid[p]), short(ppid[ppid[p]])
+      }
+    }' | head -n 60 | while IFS= read -r line; do
+      local pid rest exe parent grand flags
+      pid="${line%% *}"; rest="${line#* }"
+      exe="${rest%%|*}"; parent="${rest#*|}"; grand="${parent#*|}"; parent="${parent%%|*}"
+      flags="$(ps -o args= -p "$pid" 2>/dev/null | tr ' ' '\n' | sed -n '2,$p' \
+        | awk '$0=="--"{exit} /^-/{sub(/=.*/,""); print; next} /^(auth|status|login|logout|mcp|update|doctor|setup-token|\/config)$/{print}' | tr '\n' ' ')"
+      printf '  %s %s flags=[%s] parent=%s grandparent=%s\n' "$pid" "$exe" "${flags% }" "$parent" "$grand"
+    done
 }
 
 # claude_auth_token_shape <json> <key.path> — "len/fingerprint", or "absent".
@@ -246,18 +315,20 @@ claude_auth_with_timeout() {
 
 # Cheap state used by the monitor to detect a change between snapshots.
 claude_auth_fingerprint() {
-  local svc json rc
-  svc="$(claude_auth_keychain_service)"
-  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"; rc=$?
-  printf 'keychain-rc=%s %s | %s | file=%s' "$rc" \
-    "$(security find-generic-password -s "$svc" 2>/dev/null | grep -E '"mdat"' | sed -E 's/.*"([0-9]{14}Z).*/mdat=\1/')" \
-    "$(claude_auth_credential_summary "$json" | sed -E 's/ \([-0-9]+ min from now\)//g')" \
-    "$(stat -f '%m' "$HOME/.claude/.credentials.json" 2>/dev/null || echo absent)"
+  local label svc json rc
+  for label in app shared; do
+    if [ "$label" = app ]; then svc="$(claude_auth_keychain_service "$(claude_auth_app_store)")"; else svc="$(claude_auth_shared_service)"; fi
+    rc=0; json="$(security find-generic-password -s "$svc" -w 2>/dev/null)" || rc=$?
+    printf '%s: keychain-rc=%s %s | %s || ' "$label" "$rc" \
+      "$(security find-generic-password -s "$svc" 2>/dev/null | grep -E '"mdat"' | sed -E 's/.*"([0-9]{14}Z).*/mdat=\1/')" \
+      "$(claude_auth_credential_summary "$json" | sed -E 's/ \([-0-9]+ min from now\)//g')"
+  done
+  printf 'file=%s' "$(stat -f '%m' "$HOME/.claude/.credentials.json" 2>/dev/null || echo absent)"
 }
 
 claude_auth_snapshot_body() {
-  local phase="$1" svc meta json rc bin status_json file_json desktop
-  svc="$(claude_auth_keychain_service)"
+  local phase="$1" svc meta json rc bin status_json file_json desktop label store
+  store="$(claude_auth_app_store)"
   printf '\n=== [%s] %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$phase"
   printf 'installer: pid=%s app=%s release=%s installed=%s in-app-update=%s\n' \
     "$$" "${APP_NAME:-?}" "${TAG:-?}" "$(installed_build_tag 2>/dev/null)" "${IN_APP_UPDATE:-0}"
@@ -265,12 +336,16 @@ claude_auth_snapshot_body() {
     "${CLAUDE_CONFIG_DIR:-unset}" "${CLAUDE_SECURESTORAGE_CONFIG_DIR-unset}" \
     "${ANTHROPIC_API_KEY:+set}" "${CLAUDE_CODE_OAUTH_TOKEN:+set}" "${ANTHROPIC_AUTH_TOKEN:+set}"
 
-  meta="$(security find-generic-password -s "$svc" 2>&1)"; rc=$?
-  printf 'keychain "%s": rc=%s %s\n' "$svc" "$rc" \
-    "$(printf '%s\n' "$meta" | grep -E '"(cdat|mdat)"' | sed -E 's/.*"(cdat|mdat)".*"([0-9]{14}Z).*/\1=\2/' | tr '\n' ' ')"
-  [ "$rc" -eq 0 ] || printf 'keychain error: %s\n' "$(printf '%s' "$meta" | tail -n 1)"
-  json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"
-  printf 'keychain credential: %s\n' "$(claude_auth_credential_summary "$json")"
+  printf 'app login store: %s\n' "$store"
+  for label in app shared; do
+    if [ "$label" = app ]; then svc="$(claude_auth_keychain_service "$store")"; else svc="$(claude_auth_shared_service)"; fi
+    meta="$(security find-generic-password -s "$svc" 2>&1)"; rc=$?
+    printf '%s keychain "%s": rc=%s %s\n' "$label" "$svc" "$rc" \
+      "$(printf '%s\n' "$meta" | grep -E '"(cdat|mdat)"' | sed -E 's/.*"(cdat|mdat)".*"([0-9]{14}Z).*/\1=\2/' | tr '\n' ' ')"
+    [ "$rc" -eq 0 ] || printf '%s keychain error: %s\n' "$label" "$(printf '%s' "$meta" | tail -n 1)"
+    json="$(security find-generic-password -s "$svc" -w 2>/dev/null)"
+    printf '%s keychain credential: %s\n' "$label" "$(claude_auth_credential_summary "$json")"
+  done
 
   if [ -f "$HOME/.claude/.credentials.json" ]; then
     file_json="$(cat "$HOME/.claude/.credentials.json" 2>/dev/null)"
@@ -288,13 +363,14 @@ claude_auth_snapshot_body() {
   fi
   printf 'lock files: %s\n' "$( { find "$HOME/.claude" -maxdepth 1 -iname '*lock*' 2>/dev/null; ls -d "$HOME/.claude.json.lock" 2>/dev/null; } | tr '\n' ' ')"
 
-  bin="$(command -v claude 2>/dev/null)"
+  bin="$(claude_auth_app_claude_bin)"
+  printf 'installer PATH claude: %s\n' "$(command -v claude 2>/dev/null || echo none)"
   if [ -n "$bin" ]; then
     printf 'claude: %s -> %s, %s\n' "$bin" "$(readlink "$bin" 2>/dev/null || echo '-')" \
       "$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" --version | head -n 1)"
     # `auth status` reads stored credentials only; it never refreshes them.
-    status_json="$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 "$bin" auth status --json)"
-    printf 'claude auth status: loggedIn=%s authMethod=%s apiProvider=%s subscription=%s\n' \
+    status_json="$(claude_auth_with_timeout 15 env DISABLE_AUTOUPDATER=1 CLAUDE_SECURESTORAGE_CONFIG_DIR="$store" "$bin" auth status --json)"
+    printf 'claude auth status (app login): loggedIn=%s authMethod=%s apiProvider=%s subscription=%s\n' \
       "$(claude_auth_json_field "$status_json" loggedIn)" "$(claude_auth_json_field "$status_json" authMethod)" \
       "$(claude_auth_json_field "$status_json" apiProvider)" "$(claude_auth_json_field "$status_json" subscriptionType)"
   else
@@ -304,12 +380,8 @@ claude_auth_snapshot_body() {
   desktop="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Claude.app/Contents/Info.plist 2>/dev/null)"
   printf 'Claude Desktop: %s; bundled Claude Code: %s\n' "${desktop:-absent}" \
     "$(ls "$HOME/Library/Application Support/Claude/claude-code" 2>/dev/null | tr '\n' ' ')"
-  # Executable paths only: full argv can carry prompt text.
-  printf 'processes (pid ppid elapsed executable):\n'
-  ps -axo pid=,ppid=,etime=,comm= 2>/dev/null \
-    | grep -iE 'claude|codex|cortex|w3i' \
-    | grep -vE 'grep|Helper|crashpad|ShipIt|disclaimer|chrome-native-host|ChatGPT for Chrome' \
-    | head -n 60 | sed 's/^/  /'
+  printf 'processes (pid ppid pgid elapsed executable flags parent):\n'
+  claude_auth_processes
 }
 
 # claude_auth_snapshot <phase> — append one snapshot; never fails the caller.
@@ -908,7 +980,7 @@ ok "macOS / $ARCH"
 APP_ZIP="W3I-${ARCH}.zip"
 SUPPORT_TAR="support.tar.gz"
 POCKET_MODEL_ASSET="Pocket-English-model.tar.gz"
-POCKET_MODEL_REPOSITORY="appfactory123/pocket-tts-model-weight-dist"
+POCKET_MODEL_REPOSITORY="thisiscortex/pocket-tts-model-weight-dist"
 POCKET_MODEL_RELEASE_TAG="pocket-tts-v2.1.0-english-1"
 POCKET_MODEL_RELEASE_ASSET_ID="494264404"
 POCKET_MODEL_ROOT="$DATA_DIR/voice-tts/pocket-model"
