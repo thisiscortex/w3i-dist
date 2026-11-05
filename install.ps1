@@ -321,7 +321,7 @@ function Import-CliOverridesFromConfig {
 # downloads. Keep a literal backup so an older bundled setup.ps1 cannot erase
 # user-owned CLI paths or voice credentials/settings from the config Electron
 # reads on next launch.
-$script:PreservedConfigPattern = 'PYTHON_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GROK_BIN|GROK_HOME|KIMI_BIN|KIMI_SHARE_DIR|UV_BIN|CORTEX_OPENAI_API_KEY|OPENAI_API_KEY|CORTEX_ELEVENLABS_API_KEY|ELEVENLABS_API_KEY|CORTEX_VOICE_TTS_PROVIDER|CORTEX_VOICE_TTS_PYTHON|CORTEX_VOICE_TTS_DEVICE|CORTEX_VOICE_TTS_MODEL|CORTEX_VOICE_TTS_VOICE|CORTEX_ELEVENLABS_VOICE_ID|CORTEX_ELEVENLABS_MODEL|CORTEX_VOICE_TTS_LOCAL_VOICE|CORTEX_VOICE_TTS_POCKET_CACHE|CORTEX_VOICE_TTS_QWEN_MODEL|CORTEX_VOICE_TTS_QWEN_REVISION|CORTEX_VOICE_TTS_QWEN_CACHE|CORTEX_VOICE_TTS_QWEN_PROFILE|CORTEX_VOICE_TTS_QWEN_VOICE_PROMPT|CORTEX_VOICE_DUPLEX|CORTEX_VOICE_TTS_CAPABILITY_READY_WAIT_MS|CORTEX_VOICE_TTS_LOCAL_READY_GRACE_MS|CORTEX_VOICE_TTS_DAEMON_READY_TIMEOUT_MS|CORTEX_VOICE_TTS_LOCAL_RESPONSE_TIMEOUT_MS'
+$script:PreservedConfigPattern = 'PYTHON_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GROK_BIN|GROK_HOME|KIMI_BIN|KIMI_SHARE_DIR|UV_BIN|CORTEX_OPENAI_API_KEY|OPENAI_API_KEY|CORTEX_ELEVENLABS_API_KEY|ELEVENLABS_API_KEY|CORTEX_VOICE_TTS_PROVIDER|CORTEX_VOICE_TTS_PYTHON|CORTEX_VOICE_TTS_DEVICE|CORTEX_VOICE_TTS_MODEL|CORTEX_VOICE_TTS_VOICE|CORTEX_ELEVENLABS_VOICE_ID|CORTEX_ELEVENLABS_MODEL|CORTEX_VOICE_TTS_LOCAL_VOICE|CORTEX_VOICE_TTS_POCKET_CACHE|CORTEX_VOICE_DUPLEX|CORTEX_VOICE_TTS_CAPABILITY_READY_WAIT_MS|CORTEX_VOICE_TTS_LOCAL_READY_GRACE_MS|CORTEX_VOICE_TTS_DAEMON_READY_TIMEOUT_MS|CORTEX_VOICE_TTS_LOCAL_RESPONSE_TIMEOUT_MS'
 function Get-PreservedConfigLines {
   param([string]$Path)
   if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
@@ -983,11 +983,37 @@ try {
     Remove-InstallerDuplicateSetupHook -Path (Join-Path $DATA_DIR 'package.json')
   }
 
+  # Reconcile retired Qwen/private duplicate voice state before the new app can
+  # launch. This generated Node entrypoint is bundled from the same domain
+  # module used by app startup; an incomplete run leaves its marker absent and
+  # startup retries without making the application install itself fail.
+  Step 'Legacy voice cleanup'
+  $legacyCleanup = Join-Path $DATA_DIR 'scripts\migrate-legacy-voice-runtime.mjs'
+  $cleanupNode = Join-Path $INSTALL_DIR 'resources\appstore-node\node.exe'
+  $legacyLedger = if ($env:CORTEX_MODELS_LEDGER -and [IO.Path]::IsPathRooted($env:CORTEX_MODELS_LEDGER)) {
+    [IO.Path]::GetFullPath($env:CORTEX_MODELS_LEDGER)
+  } else {
+    Join-Path $env:USERPROFILE '.cortex-ai-sessions-w3i\models-ledger.json'
+  }
+  if ((Test-Path -LiteralPath $legacyCleanup -PathType Leaf) -and (Test-Path -LiteralPath $cleanupNode -PathType Leaf)) {
+    try {
+      & $cleanupNode $legacyCleanup --apply --summary --data-dir $DATA_DIR --ledger-path $legacyLedger
+      if ($LASTEXITCODE -eq 0) { Ok 'legacy voice state reconciled' }
+      else { Warn 'legacy voice cleanup incomplete - W3I will retry on next startup' }
+    } catch { Warn 'legacy voice cleanup could not run - W3I will retry on next startup' }
+  } else {
+    Warn 'legacy voice cleanup runtime unavailable - W3I will retry on next startup'
+  }
+
   # -- Pocket release model -------------------------------------------------
   # The model stays a distinct, versioned GitHub Release asset. It is not part
   # of the app archive or Git history; exact SHA-256 checks gate installation
   # and Pocket runs offline after this point.
+  # Pocket (the only local voice) is downloaded on demand by the app after one consent
+  # (plans/shared-voice-and-runtime-store). Installing it here, eagerly, is opt-in:
+  # CORTEX_INSTALL_EAGER_POCKET_TTS=1. Same single location either way.
   if ($env:CORTEX_INSTALL_LOCAL_VOICE -eq '1') {
+  if ($env:CORTEX_INSTALL_EAGER_POCKET_TTS -eq '1') {
   Step 'Pocket voice model'
   $pocketModelDir = Join-Path $DATA_DIR 'voice-tts\pocket-model'
   if (Test-PocketReleaseModel -Directory $pocketModelDir) {
@@ -1023,6 +1049,7 @@ try {
       Die 'could not install the verified Pocket model'
     }
     Ok 'downloaded and verified Pocket model'
+  }
   }
   }
 

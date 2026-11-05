@@ -476,7 +476,7 @@ load_cli_overrides_from_config() {
 # newer than the release support bundle it downloads, so that bundle may still
 # contain an older setup.command which rewrites the config without preserving
 # user-owned CLI paths or voice credentials/settings. Never source these values.
-PRESERVED_CONFIG_KEYS='PYTHON_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GROK_BIN|GROK_HOME|KIMI_BIN|KIMI_SHARE_DIR|UV_BIN|CORTEX_OPENAI_API_KEY|OPENAI_API_KEY|CORTEX_ELEVENLABS_API_KEY|ELEVENLABS_API_KEY|CORTEX_VOICE_TTS_PROVIDER|CORTEX_VOICE_TTS_PYTHON|CORTEX_VOICE_TTS_DEVICE|CORTEX_VOICE_TTS_MODEL|CORTEX_VOICE_TTS_VOICE|CORTEX_ELEVENLABS_VOICE_ID|CORTEX_ELEVENLABS_MODEL|CORTEX_VOICE_TTS_LOCAL_VOICE|CORTEX_VOICE_TTS_POCKET_CACHE|CORTEX_VOICE_TTS_QWEN_MODEL|CORTEX_VOICE_TTS_QWEN_REVISION|CORTEX_VOICE_TTS_QWEN_CACHE|CORTEX_VOICE_TTS_QWEN_PROFILE|CORTEX_VOICE_TTS_QWEN_VOICE_PROMPT|CORTEX_VOICE_DUPLEX|CORTEX_VOICE_TTS_CAPABILITY_READY_WAIT_MS|CORTEX_VOICE_TTS_LOCAL_READY_GRACE_MS|CORTEX_VOICE_TTS_DAEMON_READY_TIMEOUT_MS|CORTEX_VOICE_TTS_LOCAL_RESPONSE_TIMEOUT_MS'
+PRESERVED_CONFIG_KEYS='PYTHON_BIN|CLAUDE_BIN|CODEX_BIN|AGY_BIN|GROK_BIN|GROK_HOME|KIMI_BIN|KIMI_SHARE_DIR|UV_BIN|CORTEX_OPENAI_API_KEY|OPENAI_API_KEY|CORTEX_ELEVENLABS_API_KEY|ELEVENLABS_API_KEY|CORTEX_VOICE_TTS_PROVIDER|CORTEX_VOICE_TTS_PYTHON|CORTEX_VOICE_TTS_DEVICE|CORTEX_VOICE_TTS_MODEL|CORTEX_VOICE_TTS_VOICE|CORTEX_ELEVENLABS_VOICE_ID|CORTEX_ELEVENLABS_MODEL|CORTEX_VOICE_TTS_LOCAL_VOICE|CORTEX_VOICE_TTS_POCKET_CACHE|CORTEX_VOICE_DUPLEX|CORTEX_VOICE_TTS_CAPABILITY_READY_WAIT_MS|CORTEX_VOICE_TTS_LOCAL_READY_GRACE_MS|CORTEX_VOICE_TTS_DAEMON_READY_TIMEOUT_MS|CORTEX_VOICE_TTS_LOCAL_RESPONSE_TIMEOUT_MS'
 capture_preserved_config_lines() {
   [ -f "$CONFIG" ] || return 0
   local line key value
@@ -1240,6 +1240,27 @@ ditto "$WORK/support" "$DATA_DIR" || die "could not install the prepared support
 chmod +x "$DATA_DIR"/*.command "$DATA_DIR"/*.sh 2>/dev/null || true
 ok "extracted bot + support files"
 
+# Remove retired Qwen/private duplicate voice state during the upgrade itself,
+# before the new app can start and race the migration. The bundled helper is
+# generated from lib/voice/migrate-legacy-voice.ts, so installer and app startup
+# share one allowlist and marker contract. Failure is non-destructive and leaves
+# the marker absent; instrumentation retries on the next app launch.
+step "Legacy voice cleanup"
+LEGACY_VOICE_CLEANUP="$DATA_DIR/scripts/migrate-legacy-voice-runtime.mjs"
+PACKAGED_CLEANUP_NODE="$APP_PATH/Contents/Resources/appstore-node/bin/node"
+LEGACY_MODELS_LEDGER="${CORTEX_MODELS_LEDGER:-$(app_data_dir "$APP_NAME")/models-ledger.json}"
+case "$LEGACY_MODELS_LEDGER" in /*) ;; *) LEGACY_MODELS_LEDGER="$(app_data_dir "$APP_NAME")/models-ledger.json" ;; esac
+if [ -f "$LEGACY_VOICE_CLEANUP" ] && [ -x "$PACKAGED_CLEANUP_NODE" ]; then
+  if "$PACKAGED_CLEANUP_NODE" "$LEGACY_VOICE_CLEANUP" --apply --summary \
+    --data-dir "$DATA_DIR" --ledger-path "$LEGACY_MODELS_LEDGER"; then
+    ok "legacy voice state reconciled"
+  else
+    warn "legacy voice cleanup incomplete — $APP_NAME will retry on next startup"
+  fi
+else
+  warn "legacy voice cleanup runtime unavailable — $APP_NAME will retry on next startup"
+fi
+
 # The packaged app is self-contained. Bring the new UI back immediately after
 # the atomic bundle/support swap; the detached installer keeps running and the
 # relaunched app resumes progress from update.log while dependencies finish.
@@ -1267,7 +1288,10 @@ pocket_release_model_ready() {
     && pocket_file_matches "$POCKET_MODEL_ROOT/tokenizer.model" "$POCKET_TOKENIZER_SHA256"
 }
 
-if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ] && [ "$ARCH" = arm64 ]; then
+# Pocket (the only local voice) is downloaded on demand by the app after one consent
+# (plans/shared-voice-and-runtime-store). Installing it here, eagerly, is opt-in:
+# CORTEX_INSTALL_EAGER_POCKET_TTS=1. Same single location either way.
+if [ "${CORTEX_INSTALL_LOCAL_VOICE:-0}" = "1" ] && [ "${CORTEX_INSTALL_EAGER_POCKET_TTS:-0}" = "1" ] && [ "$ARCH" = arm64 ]; then
 step "Pocket voice model"
 if pocket_release_model_ready; then
   ok "verified Pocket model already installed"
