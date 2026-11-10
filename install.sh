@@ -69,6 +69,46 @@ echo "W3I installer log — $(date)"
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
 step() { printf '\n\033[1m▶ [%s] %s\033[0m\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$1"; }
+
+# ── Install footprint ───────────────────────────────────
+# Records what this installer created in <data dir>/install-footprint.tsv so
+# uninstall.sh removes only Cortex-owned items and leaves everything that was
+# already on the machine. One tab-separated record per line:
+#   product|app|data|config|userdata|bundleid <value>   identity of this install (latest run wins)
+#   link <path> <target>                       a ~/.local/bin symlink this installer made
+#   runtime bun|node <path>                    a runtime this installer downloaded
+#   brew|brew-cask <formula>                   a Homebrew package this installer added
+# A re-run merges with the previous file, so an item created by the first
+# install stays recorded after later updates.
+FOOTPRINT_FILE_NAME="install-footprint.tsv"
+FOOTPRINT_RECORDS=""
+footprint_add() {
+  local IFS=$'\t'
+  FOOTPRINT_RECORDS="${FOOTPRINT_RECORDS}$*"$'\n'
+}
+write_install_footprint() {
+  local file="$DATA_DIR/$FOOTPRINT_FILE_NAME" tmp userdata_name bundle_id
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
+  printf '%s' "$bundle_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$' || bundle_id=""
+  userdata_name="$(awk -F'"' '/"electronUserDataName"[[:space:]]*:/ { print $4; exit }' \
+    "$APP_PATH/Contents/Resources/product-profile.json" 2>/dev/null || true)"
+  printf '%s' "$userdata_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9 ]*$' || userdata_name="$APP_NAME"
+  tmp="$(mktemp "$DATA_DIR/.install-footprint.XXXXXX" 2>/dev/null)" \
+    || { warn "could not record the install footprint (uninstall will fall back to defaults)"; return 0; }
+  {
+    printf '# cortex-install-footprint v1\n'
+    printf 'product\t%s\napp\t%s\ndata\t%s\nconfig\t%s\nuserdata\t%s\n' \
+      "$APP_NAME" "$APP_PATH" "$DATA_DIR" "$CONFIG" "$HOME/Library/Application Support/$userdata_name"
+    [ -z "$bundle_id" ] || printf 'bundleid\t%s\n' "$bundle_id"
+    {
+      if [ -f "$file" ]; then
+        grep -Ev $'^(#|product\t|app\t|data\t|config\t|userdata\t|bundleid\t)' "$file" || true
+      fi
+      printf '%s' "$FOOTPRINT_RECORDS"
+    } | awk 'NF && !seen[$0]++'
+  } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file" \
+    || { rm -f "$tmp"; warn "could not record the install footprint (uninstall will fall back to defaults)"; return 0; }
+}
 die()  {
   printf '\033[31m✗ %s\033[0m\n' "$1" >&2
   printf '\033[31m  Full log: %s\033[0m\n' "$LOG_FILE" >&2
@@ -756,18 +796,24 @@ ensure_local_bin_link() {
     existing_real="$(resolve_cli_path "$local_path" 2>/dev/null || true)"
     resolved_real="$(resolve_cli_path "$resolved" 2>/dev/null || true)"
     if [ -n "$resolved_real" ] && [ "$existing_real" != "$resolved_real" ] && [ "$resolved" != "$local_path" ]; then
-      ln -sfn "$resolved" "$local_path" \
-        && ok "refreshed $name link → $local_path (now $resolved)" \
-        || warn "could not refresh $name link in $LOCAL_BIN — sign-in may use an older CLI"
+      if ln -sfn "$resolved" "$local_path"; then
+        footprint_add link "$local_path" "$resolved"
+        ok "refreshed $name link → $local_path (now $resolved)"
+      else
+        warn "could not refresh $name link in $LOCAL_BIN — sign-in may use an older CLI"
+      fi
     else
       ok "$name available at $local_path (app fallback path)"
     fi
     return 0
   fi
   [ "$resolved" = "$local_path" ] && { ok "$name available at $local_path (app fallback path)"; return 0; }
-  ln -s "$resolved" "$local_path" \
-    && ok "linked $name → $local_path (was $resolved)" \
-    || warn "could not link $name into $LOCAL_BIN — sign-in may fail with ENOENT"
+  if ln -s "$resolved" "$local_path"; then
+    footprint_add link "$local_path" "$resolved"
+    ok "linked $name → $local_path (was $resolved)"
+  else
+    warn "could not link $name into $LOCAL_BIN — sign-in may fail with ENOENT"
+  fi
 }
 
 # ── Runtime health (Bun + Node) ─────────────────────────
@@ -875,6 +921,7 @@ ensure_node() {
     # and would swallow the rest of the script, silently ending the run right
     # after this step. Detach stdin so brew can't eat the remaining commands.
     if brew install node </dev/null >/dev/null 2>&1; then
+      footprint_add brew node
       hash -r 2>/dev/null || true
       if NODE_BIN="$(find_working_node)"; then
         export PATH="$(dirname "$NODE_BIN"):$PATH"
@@ -938,6 +985,7 @@ ensure_node() {
   rm -rf "$tmp"
   hash -r 2>/dev/null || true
   if node_works "$HOME/.local/bin/node"; then
+    footprint_add runtime node "$HOME/.local/bin/node"
     NODE_BIN="$HOME/.local/bin/node"
     export PATH="$HOME/.local/bin:$PATH"
     ok "Node installed → $NODE_BIN ($("$NODE_BIN" --version))"
@@ -1239,6 +1287,9 @@ mkdir -p "$DATA_DIR"
 ditto "$WORK/support" "$DATA_DIR" || die "could not install the prepared support files"
 chmod +x "$DATA_DIR"/*.command "$DATA_DIR"/*.sh 2>/dev/null || true
 ok "extracted bot + support files"
+# Record the app/data identity now, so a run that fails later can still be
+# uninstalled; the final write adds what the remaining steps create.
+write_install_footprint
 
 # Remove retired Qwen/private duplicate voice state during the upgrade itself,
 # before the new app can start and race the migration. The bundled helper is
@@ -1338,6 +1389,7 @@ else
   fi
   if bun_works "$HOME/.bun/bin/bun"; then
     BUN_BIN="$HOME/.bun/bin/bun"
+    footprint_add runtime bun "$BUN_BIN"
     ok "bun installed: $BUN_BIN ($("$BUN_BIN" --version))"
   else
     warn "no working Bun — dependencies will be installed with npm instead"
@@ -1815,8 +1867,12 @@ if [ -d "/Applications/Google Chrome.app" ]; then
   ok "Google Chrome installed"
 elif command -v brew >/dev/null 2>&1; then
   warn "Google Chrome not found — installing via Homebrew…"
-  brew install --cask google-chrome </dev/null >/dev/null 2>&1 && ok "Google Chrome installed" \
-    || warn "install failed — install manually (https://www.google.com/chrome/); needed for the WhatsApp bot."
+  if brew install --cask google-chrome </dev/null >/dev/null 2>&1; then
+    footprint_add brew-cask google-chrome
+    ok "Google Chrome installed"
+  else
+    warn "install failed — install manually (https://www.google.com/chrome/); needed for the WhatsApp bot."
+  fi
 else
   warn "Google Chrome not found — install it (https://www.google.com/chrome/); needed for the WhatsApp bot."
 fi
@@ -1827,6 +1883,7 @@ step "Other prerequisites (informational)"
   || warn "Claude Desktop not found — needed to read your claude.ai session."
 
 # ── Done ────────────────────────────────────────────────
+write_install_footprint
 claude_auth_snapshot "install complete"
 echo
 ok "Install complete."
@@ -1835,6 +1892,7 @@ echo "  Launch the app:   open \"$APP_PATH\""
 echo "  WhatsApp bot:     install WhatsApp Accountant from the Cortex App Store"
 echo "  Shared state:     $DATA_DIR  (settings.json, sessions.json)"
 echo "  Install log:      $LOG_FILE"
+echo "  Uninstall:        bash \"$DATA_DIR/uninstall.sh\""
 echo
 if [ "$IN_APP_UPDATE" = "1" ]; then
   canonicalize_runtime_project_config || {

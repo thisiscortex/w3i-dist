@@ -81,6 +81,65 @@ function Warn ($m) { Write-Host "  ! $m"               -ForegroundColor Yellow }
 function Step ($m) { Write-Host ""; Write-Host "$([char]0x25B6) $m" -ForegroundColor White }  # drives the GUI progress bar
 function Die  ($m) { Write-Host "$([char]0x2717) $m" -ForegroundColor Red; exit 1 }
 
+# -- Install footprint ---------------------------------------------------------
+# Records what this installer created in <data dir>\install-footprint.tsv so
+# uninstall.ps1 removes only Cortex-owned items. Same format as install.sh: one
+# tab-separated record per line; identity records (product/app/data/config/
+# userdata) are rewritten each run, every other record is merged across runs.
+#   shortcut <path> | path-entry <dir> | registry <HKCU:\ key> | dir <path>
+#   runtime bun|node <path> | winget <package id>
+$script:FootprintRecords = [System.Collections.Generic.List[string]]::new()
+function Add-FootprintRecord { param([Parameter(Mandatory = $true)][string[]]$Fields) $script:FootprintRecords.Add(($Fields -join "`t")) }
+function Write-InstallFootprint {
+  try {
+    $file = Join-Path $DATA_DIR 'install-footprint.tsv'
+    $userDataName = $APP_NAME
+    $packagedProfile = Join-Path $INSTALL_DIR 'resources\product-profile.json'
+    if (Test-Path -LiteralPath $packagedProfile -PathType Leaf) {
+      $name = [string](Get-Content -LiteralPath $packagedProfile -Raw | ConvertFrom-Json).electronUserDataName
+      if ($name -match '^[A-Za-z0-9][A-Za-z0-9 ]*$') { $userDataName = $name }
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('# cortex-install-footprint v1')
+    $lines.Add("product`t$APP_NAME"); $lines.Add("app`t$INSTALL_DIR"); $lines.Add("data`t$DATA_DIR")
+    $lines.Add("config`t$CONFIG"); $lines.Add("userdata`t$(Join-Path $env:APPDATA $userDataName)")
+    $merged = @()
+    if (Test-Path -LiteralPath $file -PathType Leaf) {
+      $merged += @(Get-Content -LiteralPath $file | Where-Object { $_ -and $_ -notmatch "^(#|product`t|app`t|data`t|config`t|userdata`t)" })
+    }
+    $merged += @($script:FootprintRecords)
+    foreach ($record in ($merged | Select-Object -Unique)) { if ($record) { $lines.Add($record) } }
+    $temporary = "$file.$([Guid]::NewGuid().ToString('N')).tmp"
+    [IO.File]::WriteAllLines($temporary, $lines, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $file -Force
+  } catch { Warn ("could not record the install footprint (uninstall will fall back to defaults): " + $_.Exception.Message) }
+}
+
+# Settings -> Apps entry pointing at the uninstall.ps1 shipped in the support
+# bundle, copied beside the app so it survives a "keep data" uninstall choice.
+function Register-AppUninstallEntry {
+  param([string]$DisplayName, [string]$Version)
+  try {
+    $source = Join-Path $DATA_DIR 'uninstall.ps1'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { Warn 'uninstall.ps1 not in support bundle - Settings -> Apps entry not registered'; return }
+    $script = Join-Path $INSTALL_DIR 'uninstall.ps1'
+    Copy-Item -LiteralPath $source -Destination $script -Force
+    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$APP_NAME"
+    New-Item -Path $key -Force | Out-Null
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$script`" -Product `"$APP_NAME`""
+    $sizeKb = [int]((Get-ChildItem -LiteralPath $INSTALL_DIR -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1KB)
+    $values = [ordered]@{
+      DisplayName = $DisplayName; DisplayVersion = $Version; Publisher = 'Cortex'; DisplayIcon = $APP_EXE
+      InstallLocation = $INSTALL_DIR; UninstallString = $command; QuietUninstallString = "$command -Yes"
+    }
+    foreach ($name in $values.Keys) { New-ItemProperty -Path $key -Name $name -Value ([string]$values[$name]) -PropertyType String -Force | Out-Null }
+    foreach ($name in @('NoModify', 'NoRepair')) { New-ItemProperty -Path $key -Name $name -Value 1 -PropertyType DWord -Force | Out-Null }
+    New-ItemProperty -Path $key -Name 'EstimatedSize' -Value $sizeKb -PropertyType DWord -Force | Out-Null
+    Add-FootprintRecord 'registry', $key
+    Ok "registered in Settings -> Apps (uninstall: $script)"
+  } catch { Warn ("could not register the Settings -> Apps uninstall entry: " + $_.Exception.Message) }
+}
+
 Write-Host "$APP_NAME - installer"
 
 # -- Preflight ---------------------------------------------------------------
@@ -692,7 +751,11 @@ function Install-VerifiedBun {
   if ($LASTEXITCODE -ne 0 -or [string]$version -ne '1.3.14') { throw 'Verified Bun runtime did not pass its version check.' }
   $env:Path = "$bin;$env:Path"
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if (@($userPath -split ';') -notcontains $bin) { [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User') }
+  if (@($userPath -split ';') -notcontains $bin) {
+    [Environment]::SetEnvironmentVariable('Path', "$bin;$userPath", 'User')
+    Add-FootprintRecord 'path-entry', $bin
+  }
+  Add-FootprintRecord 'runtime', 'bun', $target
   Ok "installed verified Bun $version"
 }
 
@@ -758,6 +821,7 @@ function Add-UserPathEntry {
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (@($userPath -split ';') -notcontains $Directory) {
     [Environment]::SetEnvironmentVariable('Path', (@($Directory, $userPath) | Where-Object { $_ }) -join ';', 'User')
+    Add-FootprintRecord 'path-entry', $Directory
   }
 }
 
@@ -793,6 +857,7 @@ function Install-VerifiedNode {
   New-Item -ItemType Directory -Force -Path $npmGlobal | Out-Null
   Add-UserPathEntry $npmGlobal
   Add-UserPathEntry $CORTEX_NODE_DIR
+  Add-FootprintRecord 'runtime', 'node', $CORTEX_NODE_DIR
   Ok "installed verified Node $($lts.version) -> $CORTEX_NODE_DIR"
 }
 
@@ -943,6 +1008,7 @@ try {
       $lnk.WorkingDirectory = $INSTALL_DIR
       $lnk.IconLocation = $APP_EXE
       $lnk.Save()
+      Add-FootprintRecord 'shortcut', (Join-Path $lnkDir "$displayName.lnk")
       Set-InstallerShortcutAppId -ShortcutPath (Join-Path $lnkDir "$displayName.lnk") -AppId $APP_USER_MODEL_ID
       if ($displayName -ne $APP_NAME) {
         $oldPath = Join-Path $lnkDir "$APP_NAME.lnk"
@@ -953,7 +1019,10 @@ try {
       }
     } catch { $notificationIdentityReady = $false; Warn ("could not register shortcut notifications: " + $_.Exception.Message) }
   }
-  try { Register-InstallerNotificationAppId -AppId $APP_USER_MODEL_ID -DisplayName $displayName }
+  try {
+    Register-InstallerNotificationAppId -AppId $APP_USER_MODEL_ID -DisplayName $displayName
+    Add-FootprintRecord 'registry', ('HKCU:\Software\Classes\AppUserModelId\' + $APP_USER_MODEL_ID)
+  }
   catch { $notificationIdentityReady = $false; Warn ("could not register Windows notification identity: " + $_.Exception.Message) }
   if ($notificationIdentityReady) { Ok 'created Start Menu + Desktop shortcuts with product notification identity' }
   else { Warn 'notification shortcut registration was incomplete; the packaged app will retry its Start Menu identity' }
@@ -976,6 +1045,9 @@ try {
     Die 'tar.exe not found - Windows 10 1803+ is required.'
   }
   Ok 'extracted bot + support files'
+  # Record the app/data identity now, so a run that fails later can still be
+  # uninstalled; the final write adds what the remaining steps create.
+  Write-InstallFootprint
   if ($env:CORTEX_INSTALL_SETUP) {
     # The launcher carries the reviewed setup source; do not run a historical
     # setup script from an older support bundle when using this installer.
@@ -1076,6 +1148,7 @@ try {
       & winget install --id Oven-sh.Bun -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
       Sync-Path
       $script:BunBin = Find-WorkingBun
+      if ($script:BunBin) { Add-FootprintRecord 'winget', 'Oven-sh.Bun' }
     }
     if ($script:BunBin) {
       Ok "bun installed: $script:BunBin"
@@ -1101,6 +1174,7 @@ try {
       & winget install --id OpenJS.NodeJS.LTS -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
       Sync-Path
       $script:NodeBin = Find-WorkingNode
+      if ($script:NodeBin) { Add-FootprintRecord 'winget', 'OpenJS.NodeJS.LTS' }
     }
     if ($script:NodeBin) { Ok "node installed: $script:NodeBin" }
     else { Warn 'continuing without Node - npm-managed provider CLIs and node-based MCP servers may be unavailable. Install Node from https://nodejs.org.' }
@@ -1360,7 +1434,7 @@ try {
   } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
     Warn 'Google Chrome not found - installing via winget...'
     & winget install --id Google.Chrome -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null
-    if ($chromePaths | Where-Object { Test-Path $_ }) { Ok 'Google Chrome installed' }
+    if ($chromePaths | Where-Object { Test-Path $_ }) { Add-FootprintRecord 'winget', 'Google.Chrome'; Ok 'Google Chrome installed' }
     else { Warn 'install failed - install manually (https://www.google.com/chrome/); needed for the WhatsApp bot.' }
   } else {
     Warn 'Google Chrome not found - install it (https://www.google.com/chrome/); needed for the WhatsApp bot.'
@@ -1374,6 +1448,12 @@ try {
   )
   if ($claudeDesktop | Where-Object { Test-Path $_ }) { Ok 'Claude Desktop installed' }
   else { Warn 'Claude Desktop not found - needed to read your claude.ai session.' }
+
+  $installedVersion = ''
+  try { $installedVersion = [string](Get-Content (Join-Path $INSTALL_DIR 'resources\standalone\version.json') -Raw | ConvertFrom-Json).tag } catch {}
+  if (-not $installedVersion) { $installedVersion = [string]$TAG }
+  Register-AppUninstallEntry -DisplayName $displayName -Version $installedVersion
+  Write-InstallFootprint
 }
 finally {
   Remove-Item $WORK -Recurse -Force -ErrorAction SilentlyContinue
